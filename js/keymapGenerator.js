@@ -1,0 +1,225 @@
+// ═══ KEYMAP GENERATOR ═══
+// Converts app State → valid ZMK .keymap source string
+// Constraints:
+//   - Max 4 layers (hard limit, matches overlay rows=4 columns=3)
+//   - Max 9 keys per layer (3×3 matrix), less = TRANS
+//   - Encoder is independent — 3 fixed modes (scroll/volume/brightness)
+//   - FN + encoder SW on row 3 (direct GPIO, 2 positions)
+//   - Encoder push cycles modes — fixed, not user editable
+
+const KeymapGenerator = (() => {
+
+  const MAX_LAYERS = 4;
+  const KEYS_PER_LAYER = 9;
+
+  // ── ZMK behavior prefix resolver ──
+  // Raw codes like 'LC(Z)' → '&kp LC(Z)'
+  // Layer codes like 'TOG 1' → '&tog 1'
+  // Trans → '&trans'
+  // None  → '&none'
+  function _resolveBinding(code) {
+    if (!code || code === 'TRANS' || code === 'trans') return '&trans';
+    if (code === 'NONE'  || code === 'none')  return '&none';
+
+    const lower = code.toLowerCase().trim();
+
+    // Layer behaviors
+    if (lower.startsWith('tog '))  return `&tog ${code.split(' ')[1]}`;
+    if (lower.startsWith('to '))   return `&to ${code.split(' ')[1]}`;
+    if (lower.startsWith('mo '))   return `&mo ${code.split(' ')[1]}`;
+    if (lower.startsWith('lt '))   return `&lt ${code.slice(3)}`;
+    if (lower.startsWith('mt '))   return `&mt ${code.slice(3)}`;
+
+    // Macro reference
+    if (lower.startsWith('macro_')) return `&${code}`;
+
+    // Everything else = kp
+    return `&kp ${code}`;
+  }
+
+  // ── Pad or trim keys array to exactly KEYS_PER_LAYER ──
+  function _normalizeKeys(keys) {
+    const result = [...keys].slice(0, KEYS_PER_LAYER);
+    while (result.length < KEYS_PER_LAYER) result.push('TRANS');
+    return result;
+  }
+
+  // ── Format bindings as aligned columns (3 per row) ──
+  function _formatBindingsBlock(bindings, indent) {
+    const lines = [];
+    for (let i = 0; i < bindings.length; i += 3) {
+      const row = bindings.slice(i, i + 3)
+        .map(b => b.padEnd(22))
+        .join(' ');
+      lines.push(`${indent}${row.trimEnd()}`);
+    }
+    return lines.join('\n');
+  }
+
+  // ── Generate macros block if any macro bindings exist ──
+  function _generateMacros(layers) {
+    const macros = [];
+
+    layers.forEach(layer => {
+      layer.keys.forEach(key => {
+        if (key && key.startsWith('macro_')) {
+          // Check if already added
+          if (!macros.find(m => m.id === key)) {
+            macros.push({ id: key, label: key.replace('macro_', '') });
+          }
+        }
+      });
+    });
+
+    if (macros.length === 0) return '';
+
+    const blocks = macros.map(m => `
+    ${m.id}: ${m.id} {
+        compatible = "zmk,behavior-macro";
+        #binding-cells = <0>;
+        bindings = <&kp TRANS>; /* TODO: set macro steps */
+        label = "${m.label.toUpperCase()}";
+    };`).join('\n');
+
+    return `
+    macros {
+${blocks}
+    };
+`;
+  }
+
+  // ── Generate sensor-bindings for encoder ──
+  // 3 modes × CW/CCW — one per layer cycling through modes
+  // Layer 0 → scroll, Layer 1 → volume, Layer 2 → brightness, Layer 3+ → scroll
+  function _encoderSensorBinding(encoder, layerIndex) {
+    const modeMap = ['scroll', 'volume', 'brightness', 'scroll'];
+    const mode = modeMap[Math.min(layerIndex, 3)];
+    const b = encoder[mode];
+    return `<&inc_dec_kp ${b.cw} ${b.ccw}>`;
+  }
+
+  // ── Sanitize layer name → valid ZMK label ──
+  function _layerLabel(name, index) {
+    const safe = (name || `layer_${index}`)
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, '_')
+      .replace(/^[0-9]/, '_$&');
+    return safe;
+  }
+
+  // ══════════════════════════════════════════
+  //  MAIN: generate(.keymap string)
+  // ══════════════════════════════════════════
+  function generate(state) {
+    const { layers, encoder } = state;
+
+    // Enforce max 4 layers
+    const activeLayers = layers.slice(0, MAX_LAYERS);
+
+    const macrosBlock = _generateMacros(activeLayers);
+
+    // Build each layer block
+    const layerBlocks = activeLayers.map((layer, i) => {
+      const keys     = _normalizeKeys(layer.keys);
+      const bindings = keys.map(_resolveBinding);
+
+      // Row 3: FN key + encoder SW (cycles mode — fixed &trans placeholder)
+      const fnBinding  = _resolveBinding(layer.fnAction || 'TRANS');
+      const encSwBinding = '&trans'; // encoder push is handled by ZMK sensor config
+
+      const allBindings = [
+        ...bindings,
+        fnBinding,
+        encSwBinding,
+      ];
+
+      const label    = _layerLabel(layer.name, i);
+      const bindingsFormatted = _formatBindingsBlock(allBindings, '                ');
+      const sensorBinding = _encoderSensorBinding(encoder, i);
+
+      return `        ${label}: layer_${i} {
+            label = "${layer.name.toUpperCase()}";
+            bindings = <
+${bindingsFormatted}
+            >;
+            sensor-bindings = ${sensorBinding};
+        };`;
+    });
+
+    // ── Assemble final .keymap ──
+    const keymapContent = `/*
+ * ZMK Keymap — Auto-generated by sPadStudio
+ * Device  : nice!nano v2 · 3×3 Macropad
+ * Layers  : ${activeLayers.length} / ${MAX_LAYERS} max
+ * Encoder : 3 modes (scroll / volume / brightness)
+ * Generated: ${new Date().toISOString()}
+ *
+ * DO NOT EDIT MANUALLY — regenerate via sPadStudio
+ */
+
+#include <behaviors.dtsi>
+#include <dt-bindings/zmk/keys.h>
+#include <dt-bindings/zmk/outputs.h>
+/ {
+${macrosBlock}
+    keymap {
+        compatible = "zmk,keymap";
+
+${layerBlocks.join('\n\n')}
+
+    };
+};
+`;
+
+    return keymapContent.trim();
+  }
+
+  // ── Validate state before generating ──
+  function validate(state) {
+    const errors   = [];
+    const warnings = [];
+
+    if (!state.layers || state.layers.length === 0) {
+      errors.push('No layers defined.');
+    }
+
+    if (state.layers.length > MAX_LAYERS) {
+      warnings.push(`${state.layers.length} layers defined — only first ${MAX_LAYERS} will be compiled.`);
+    }
+
+    state.layers.forEach((layer, i) => {
+      if (!layer.name || layer.name.trim() === '') {
+        warnings.push(`Layer ${i} has no name — will use "layer_${i}".`);
+      }
+      if (!layer.keys || layer.keys.length === 0) {
+        errors.push(`Layer ${i} ("${layer.name}") has no keys.`);
+      }
+      if (layer.keys && layer.keys.length > KEYS_PER_LAYER) {
+        warnings.push(`Layer ${i} ("${layer.name}") has ${layer.keys.length} keys — only first ${KEYS_PER_LAYER} will be used.`);
+      }
+    });
+
+    if (!state.encoder) {
+      errors.push('Encoder config missing.');
+    } else {
+      ['scroll', 'volume', 'brightness'].forEach(mode => {
+        if (!state.encoder[mode]?.cw || !state.encoder[mode]?.ccw) {
+          errors.push(`Encoder mode "${mode}" is missing CW or CCW binding.`);
+        }
+      });
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
+  // ── Preview: returns formatted string for Review page ──
+  function preview(state) {
+    const result = validate(state);
+    if (!result.valid) {
+      return `/* Validation errors:\n${result.errors.map(e => ' * ERROR: ' + e).join('\n')}\n */`;
+    }
+    return generate(state);
+  }
+
+  return { generate, validate, preview, MAX_LAYERS, KEYS_PER_LAYER };
+})();

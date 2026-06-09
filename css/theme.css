@@ -1,0 +1,29 @@
+/* ═══ THEME — Dark/Light toggle ═══ */
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --color-bg:              #f0f2f8;
+    --color-surface:         #ffffff;
+    --color-surface-2:       #f5f6fb;
+    --color-surface-offset:  #eceef8;
+    --color-surface-dynamic: #e2e5f4;
+    --color-divider:         #dde0ef;
+    --color-border:          #cdd2e8;
+    --color-text:            #1a1f35;
+    --color-text-muted:      #5a6282;
+    --color-text-faint:      #a0a8c0;
+    --color-primary:         #0284c7;
+    --color-primary-hover:   #0369a1;
+    --color-primary-highlight: #e0f2fe;
+    --shadow-key: 0 4px 0 oklch(0.4 0.06 260 / 0.25), 0 6px 12px oklch(0.2 0.02 260 / 0.1);
+  }
+}
+
+/* Theme toggle button */
+#theme-toggle {
+  transition: color var(--transition), background var(--transition);
+}
+#theme-toggle:hover {
+  color: var(--color-primary);
+  background: var(--color-primary-highlight);
+}

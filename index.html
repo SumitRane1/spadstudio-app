@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>sPadStudio — Macropad Configurator</title>
+
+  <!-- Fonts -->
+  <link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&f[]=general-sans@400,500,600&display=swap" rel="stylesheet" />
+
+  <!-- CSS -->
+  <link rel="stylesheet" href="css/base.css" />
+  <link rel="stylesheet" href="css/theme.css" />
+  <link rel="stylesheet" href="css/layout.css" />
+  <link rel="stylesheet" href="css/components.css" />
+  <link rel="stylesheet" href="css/editor.css" />
+</head>
+<body>
+
+  <!-- ═══ HEADER ═══ -->
+  <header class="app-header">
+    <div class="header-brand">
+      <svg class="brand-logo" viewBox="0 0 32 32" fill="none" aria-label="sPadStudio">
+        <rect x="2"  y="2"  width="12" height="12" rx="3" fill="currentColor" opacity="0.9"/>
+        <rect x="18" y="2"  width="12" height="12" rx="3" fill="currentColor" opacity="0.6"/>
+        <rect x="2"  y="18" width="12" height="12" rx="3" fill="currentColor" opacity="0.6"/>
+        <rect x="18" y="18" width="12" height="12" rx="3" fill="currentColor" opacity="0.3"/>
+      </svg>
+      <span class="brand-name">sPad<strong>Studio</strong></span>
+      <span class="brand-badge">BETA</span>
+    </div>
+
+    <nav class="step-nav" aria-label="Configuration steps">
+      <button class="step-btn active" data-step="profiles">
+        <span class="step-num">1</span> Profile
+      </button>
+      <span class="step-divider" aria-hidden="true">›</span>
+      <button class="step-btn" data-step="editor">
+        <span class="step-num">2</span> Editor
+      </button>
+      <span class="step-divider" aria-hidden="true">›</span>
+      <button class="step-btn" data-step="review">
+        <span class="step-num">3</span> Review
+      </button>
+      <span class="step-divider" aria-hidden="true">›</span>
+      <button class="step-btn" data-step="flash">
+        <span class="step-num">4</span> Flash
+      </button>
+    </nav>
+
+    <div class="header-actions">
+      <button class="btn btn-ghost btn-sm" id="btn-save" title="Save configuration">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+          <polyline points="17,21 17,13 7,13 7,21"/>
+          <polyline points="7,3 7,8 15,8"/>
+        </svg>
+        Save
+      </button>
+
+      <button class="btn btn-ghost btn-sm" id="btn-export" title="Export config JSON">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        Export
+      </button>
+
+      <!-- Device page button -->
+      <button class="btn btn-ghost btn-sm" id="btn-device" title="My Device">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="4" y="2" width="16" height="20" rx="2"/>
+          <circle cx="12" cy="17" r="1" fill="currentColor"/>
+          <path d="M9 7h6M9 11h4"/>
+        </svg>
+        Device
+      </button>
+
+      <button class="icon-btn" id="theme-toggle" data-theme-toggle aria-label="Toggle theme">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ═══ MAIN ═══ -->
+  <main class="app-main">
+
+    <!-- ── SECTION 1: PROFILES ── -->
+    <section class="app-section active" id="section-profiles">
+      <div class="section-header">
+        <h1 class="section-title">Choose a Base Profile</h1>
+        <p class="section-sub">Start from a preset or build from scratch</p>
+      </div>
+      <div class="profile-grid" id="profile-grid">
+        <!-- Rendered by profiles.js -->
+      </div>
+    </section>
+
+    <!-- ── SECTION 2: EDITOR ── -->
+    <section class="app-section" id="section-editor">
+      <div class="editor-layout">
+
+        <!-- Left: Layer tabs + encoder + FN -->
+        <aside class="editor-sidebar">
+          <div class="sidebar-block">
+            <div class="sidebar-label">LAYERS</div>
+            <div class="layer-tabs" id="layer-tabs">
+              <!-- Rendered by layers.js -->
+            </div>
+            <button class="btn btn-ghost btn-sm btn-full" id="btn-add-layer">
+              + Add Layer
+            </button>
+          </div>
+
+          <div class="sidebar-block">
+            <div class="sidebar-label">ENCODER</div>
+            <div id="encoder-panel">
+              <!-- Rendered by encoder.js -->
+            </div>
+          </div>
+
+          <div class="sidebar-block">
+            <div class="sidebar-label">FN BUTTON</div>
+            <div id="fn-panel">
+              <!-- Rendered by editor.js -->
+            </div>
+          </div>
+        </aside>
+
+        <!-- Center: Visual pad -->
+        <div class="editor-center">
+          <div class="pad-wrapper">
+            <div class="pad-label">NICENANO MACROPAD</div>
+            <div class="pad-grid" id="pad-grid">
+              <!-- Rendered by editor.js -->
+            </div>
+            <div class="pad-extras">
+              <button class="fn-key-btn" id="fn-key-btn">FN</button>
+              <div class="encoder-visual" id="encoder-visual">
+                <div class="encoder-ring">
+                  <div class="encoder-center-btn">●</div>
+                </div>
+                <div class="encoder-mode-label" id="encoder-mode-label">SCROLL</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right: Inspector -->
+        <aside class="editor-inspector" id="editor-inspector">
+          <div class="inspector-empty" id="inspector-empty">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="1.5" opacity="0.3">
+              <rect x="3"  y="3"  width="7" height="7" rx="1"/>
+              <rect x="14" y="3"  width="7" height="7" rx="1"/>
+              <rect x="3"  y="14" width="7" height="7" rx="1"/>
+              <rect x="14" y="14" width="7" height="7" rx="1"/>
+            </svg>
+            <p>Click any key to edit its binding</p>
+          </div>
+          <div class="inspector-content hidden" id="inspector-content">
+            <!-- Rendered by editor.js when key is selected -->
+          </div>
+        </aside>
+
+      </div>
+    </section>
+
+    <!-- ── SECTION 3: REVIEW ── -->
+    <section class="app-section" id="section-review">
+      <div class="section-header">
+        <h1 class="section-title">Review Configuration</h1>
+        <p class="section-sub">Check everything before flashing</p>
+      </div>
+      <div id="review-content">
+        <!-- Rendered by review.js -->
+      </div>
+    </section>
+
+    <!-- ── SECTION 4: FLASH ── -->
+    <section class="app-section" id="section-flash">
+      <div class="section-header">
+        <h1 class="section-title">Flash Firmware</h1>
+        <p class="section-sub">Write firmware to your macropad</p>
+      </div>
+      <div id="flash-content">
+        <!-- Rendered by flash.js -->
+      </div>
+    </section>
+
+    <!-- ── SECTION 5: DEVICE (standalone, not a step) ── -->
+    <section class="app-section" id="section-device">
+      <div id="device-content">
+        <!-- Rendered by device.js -->
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ═══ KEY PICKER MODAL ═══ -->
+  <div class="modal-overlay hidden" id="modal-overlay">
+    <div class="modal" id="modal-keypicker" role="dialog" aria-modal="true"
+         aria-labelledby="keypicker-title">
+      <div class="modal-header">
+        <h2 class="modal-title" id="keypicker-title">Set Key Binding</h2>
+        <button class="icon-btn modal-close" id="modal-close" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-search">
+        <input type="text" id="keycode-search"
+               placeholder="Search shortcuts, keys…"
+               autocomplete="off"
+               aria-label="Search keycodes" />
+      </div>
+      <div class="modal-categories" id="modal-categories">
+        <!-- Category filter tabs rendered by keycodes.js -->
+      </div>
+      <div class="modal-keylist" id="modal-keylist">
+        <!-- Key list rendered by keycodes.js -->
+      </div>
+      <div class="modal-footer">
+        <span class="selected-preview" id="selected-preview">No binding selected</span>
+        <button class="btn btn-primary" id="modal-confirm">Apply</button>
+        <button class="btn btn-ghost"   id="modal-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ ADD LAYER MODAL (injected by layers.js) ═══ -->
+  <!-- layers.js creates #modal-add-layer-overlay dynamically -->
+
+  <!-- ═══ TOAST ═══ -->
+  <div class="toast-container" id="toast-container" aria-live="polite"></div>
+
+  <!-- ═══ JS MODULES — order matters ═══ -->
+  <script src="js/config.js"></script>
+  <script src="js/state.js"></script>
+  <script src="js/keycodes.js"></script>
+  <script src="js/keymapGenerator.js"></script>
+  <script src="js/layer-presets.js"></script>
+  <script src="js/profiles.js"></script>
+  <script src="js/router.js"></script>
+  <script src="js/layers.js"></script>
+  <script src="js/encoder.js"></script>
+  <script src="js/editor.js"></script>
+  <script src="js/review.js"></script>
+  <script src="js/githubFlash.js"></script>
+  <script src="js/flash.js"></script>
+  <script src="js/device.js"></script>
+  <script src="js/app.js"></script>
+
+</body>
+</html>
