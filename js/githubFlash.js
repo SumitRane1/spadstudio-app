@@ -1,4 +1,7 @@
 // ═══ GITHUB FLASH — Real GitHub API integration ═══
+// Flow: generate keymap → push to repo branch →
+//       wait for Actions build → Worker downloads+unzips → returns raw .uf2 → flash
+
 const GitHubFlash = (() => {
 
   let _config = {
@@ -244,6 +247,7 @@ const GitHubFlash = (() => {
     throw new Error('Build timed out after 10 minutes.');
   }
 
+  // ── Worker downloads ZIP, unzips it, returns raw .uf2 bytes ──
   async function _downloadArtifact(runId) {
     const data = await _apiGet(`/actions/runs/${runId}/artifacts`);
     if (!data.artifacts || data.artifacts.length === 0) {
@@ -256,50 +260,25 @@ const GitHubFlash = (() => {
 
     console.log('[GitHubFlash] Artifact found:', artifact.name, artifact.id);
 
-    const zipRes = await fetch(
+    // Worker handles download + unzip — browser receives raw .uf2
+    const uf2Res = await fetch(
       `${_config.workerUrl}/repos/${_config.owner}/${_config.repo}/actions/artifacts/${artifact.id}/zip`,
       { headers: _headers() }
     );
 
-    if (!zipRes.ok) throw new Error(`Artifact download failed: ${zipRes.status}`);
-
-    const zipBuffer = await zipRes.arrayBuffer();
-    console.log('[GitHubFlash] ZIP size:', zipBuffer.byteLength, 'bytes');
-
-    if (zipBuffer.byteLength < 100) {
-      throw new Error('Downloaded ZIP is too small — likely truncated or empty.');
+    if (!uf2Res.ok) {
+      const err = await uf2Res.json().catch(() => ({}));
+      throw new Error(`Firmware download failed: ${uf2Res.status} ${err.error || ''}`);
     }
 
-    return await _extractUf2FromZip(zipBuffer);
-  }
+    const uf2Buffer = await uf2Res.arrayBuffer();
+    console.log('[GitHubFlash] UF2 size:', uf2Buffer.byteLength, 'bytes');
 
-  // ── Uses fflate library for reliable ZIP decompression ──
-  async function _extractUf2FromZip(zipBuffer) {
-    return new Promise((resolve, reject) => {
-      try {
-        const bytes = new Uint8Array(zipBuffer);
+    if (uf2Buffer.byteLength < 512) {
+      throw new Error('UF2 too small — Worker extraction may have failed.');
+    }
 
-        // Use fflate to unzip
-        fflate.unzip(bytes, (err, unzipped) => {
-          if (err) {
-            reject(new Error('ZIP extraction failed: ' + err.message));
-            return;
-          }
-
-          // Find the .uf2 file
-          const uf2Key = Object.keys(unzipped).find(k => k.endsWith('.uf2'));
-          if (!uf2Key) {
-            reject(new Error('zmk.uf2 not found in build artifact ZIP. Files: ' + Object.keys(unzipped).join(', ')));
-            return;
-          }
-
-          console.log('[GitHubFlash] Extracted:', uf2Key, unzipped[uf2Key].byteLength, 'bytes');
-          resolve(unzipped[uf2Key].buffer);
-        });
-      } catch (e) {
-        reject(new Error('ZIP parse error: ' + e.message));
-      }
-    });
+    return uf2Buffer;
   }
 
   async function _deleteBranch(branchName) {
