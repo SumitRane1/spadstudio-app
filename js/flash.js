@@ -2,7 +2,8 @@
 
 const Flash = (() => {
 
-  let _isBusy = false;
+  let _isBusy    = false;
+  let _uf2Buffer = null; // compiled firmware stored in memory
 
   // ════════════════════════════════════════
   //  RENDER
@@ -67,8 +68,8 @@ const Flash = (() => {
             <span class="badge badge-warning">3–5 min</span>
           </div>
           <div class="flash-mode-desc">
-            Pushes your keymap to GitHub, triggers a ZMK Actions build,
-            downloads the firmware, and writes it to your NICENANO drive.
+            Pushes your keymap to GitHub and triggers a ZMK Actions build.
+            Once compiled, click <strong>Flash Device</strong> to write firmware.
           </div>
 
           <div class="progress-wrap hidden" id="compile-progress">
@@ -78,16 +79,22 @@ const Flash = (() => {
             <div class="progress-step-label" id="compile-step">Waiting…</div>
           </div>
 
+          <!-- TWO BUTTONS: Compile + Flash -->
           <div class="flash-btn-row">
             <button class="btn btn-primary btn-lg" id="btn-compile" style="flex:1;">
-              🔨 Compile & Flash
+              🔨 Compile
             </button>
-            <button class="btn btn-ghost btn-lg hidden" id="btn-cancel-compile"
-                    title="Cancel build">
+            <button class="btn btn-success btn-lg" id="btn-flash-device" style="flex:1;" disabled>
+              ⚡ Flash Device
+            </button>
+            <button class="btn btn-ghost btn-lg hidden" id="btn-cancel-compile" title="Cancel build">
               ✕ Cancel
             </button>
           </div>
-          <p class="flash-hint">Requires Chrome or Edge. Build takes 3–5 minutes.</p>
+          <p class="flash-hint">
+            Step 1: Click <strong>Compile</strong> to build firmware (3–5 min).<br>
+            Step 2: Double-tap reset on device → click <strong>Flash Device</strong>.
+          </p>
         </div>
 
         <!-- ── Export ── -->
@@ -121,13 +128,17 @@ const Flash = (() => {
     // ── Instant flash ──
     document.getElementById('btn-instant-flash')?.addEventListener('click', _onInstantFlash);
 
-    // ── Full compile ──
+    // ── Compile only ──
     document.getElementById('btn-compile')?.addEventListener('click', _onCompile);
+
+    // ── Flash device (called AFTER compile, directly on button click = user gesture) ──
+    document.getElementById('btn-flash-device')?.addEventListener('click', _onFlashDevice);
 
     // ── Cancel compile ──
     document.getElementById('btn-cancel-compile')?.addEventListener('click', () => {
       GitHubFlash.cancel();
-      _isBusy = false;
+      _isBusy    = false;
+      _uf2Buffer = null;
       App.showToast('Build cancelled', 'warning');
       render();
     });
@@ -164,13 +175,12 @@ const Flash = (() => {
 
     try {
       _setProgress('instant', 10, 'Loading base firmware…');
-
       const uf2Buffer = await GitHubFlash.flashBase(
         (pct, msg) => _setProgress('instant', pct, msg)
       );
 
       _setProgress('instant', 70, 'Opening device picker…');
-      await GitHubFlash.writeToDevice(uf2Buffer);
+      await _writeToDevice(uf2Buffer);
 
       _setProgress('instant', 100, '✅ Flash complete!');
       App.showToast('Firmware flashed! ✅', 'success');
@@ -185,48 +195,110 @@ const Flash = (() => {
   }
 
   // ════════════════════════════════════════
-  //  FULL COMPILE
+  //  COMPILE (build only — no flash)
   // ════════════════════════════════════════
 
   async function _onCompile() {
     if (_isBusy) return;
-    _isBusy = true;
+    _isBusy    = true;
+    _uf2Buffer = null;
 
-    const compileBtn = document.getElementById('btn-compile');
-    const cancelBtn  = document.getElementById('btn-cancel-compile');
+    const compileBtn    = document.getElementById('btn-compile');
+    const flashBtn      = document.getElementById('btn-flash-device');
+    const cancelBtn     = document.getElementById('btn-cancel-compile');
 
     if (compileBtn) compileBtn.disabled = true;
+    if (flashBtn)   flashBtn.disabled   = true;
     if (cancelBtn)  cancelBtn.classList.remove('hidden');
 
     try {
-      // Validate first
       const validation = KeymapGenerator.validate(State.get());
       if (!validation.valid) throw new Error(validation.errors[0]);
       validation.warnings.forEach(w => App.showToast(w, 'warning'));
 
-      // Build
-      const uf2Buffer = await GitHubFlash.buildAndFlash(
+      // Build + download UF2 — store in memory
+      _uf2Buffer = await GitHubFlash.buildAndFlash(
         (pct, msg) => _setProgress('compile', pct, msg)
       );
 
-      // Flash to device
-      _setProgress('compile', 92, 'Opening device picker…');
-      await GitHubFlash.writeToDevice(uf2Buffer);
+      _setProgress('compile', 100, '✅ Firmware ready! Now click Flash Device.');
+      App.showToast('Compiled! Click ⚡ Flash Device to write firmware.', 'success');
 
-      _setProgress('compile', 100, '✅ Firmware flashed!');
-      App.showToast('Firmware compiled and flashed! ✅', 'success');
-
-      // Mark state clean
-      State.set({ buildMode: 'instant', isDirty: false });
+      // Enable flash button
+      if (flashBtn) flashBtn.disabled = false;
 
     } catch (err) {
+      _uf2Buffer = null;
       _setProgress('compile', 0, `❌ ${err.message}`);
       App.showToast(err.message, 'error');
+      if (flashBtn) flashBtn.disabled = true;
     } finally {
       _isBusy = false;
       if (compileBtn) compileBtn.disabled = false;
       if (cancelBtn)  cancelBtn.classList.add('hidden');
     }
+  }
+
+  // ════════════════════════════════════════
+  //  FLASH DEVICE (separate button — direct user gesture)
+  // ════════════════════════════════════════
+
+  async function _onFlashDevice() {
+    if (!_uf2Buffer) {
+      App.showToast('No compiled firmware — click Compile first.', 'error');
+      return;
+    }
+
+    const flashBtn = document.getElementById('btn-flash-device');
+    if (flashBtn) flashBtn.disabled = true;
+
+    try {
+      // showDirectoryPicker called DIRECTLY in click handler = user gesture ✅
+      await _writeToDevice(_uf2Buffer);
+
+      _setProgress('compile', 100, '✅ Firmware flashed!');
+      App.showToast('Firmware flashed! ✅', 'success');
+
+      // Mark state clean
+      State.set({ buildMode: 'instant', isDirty: false });
+      _uf2Buffer = null;
+
+    } catch (err) {
+      App.showToast(err.message, 'error');
+      if (flashBtn) flashBtn.disabled = false; // re-enable so user can retry
+    }
+  }
+
+  // ════════════════════════════════════════
+  //  WRITE TO DEVICE (folder picker — called only from click handlers)
+  // ════════════════════════════════════════
+
+  async function _writeToDevice(uf2Buffer) {
+    if (!('showDirectoryPicker' in window)) {
+      throw new Error('File System Access API not supported. Use Chrome or Edge.');
+    }
+
+    let dirHandle;
+    try {
+      dirHandle = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'desktop' });
+    } catch (e) {
+      if (e.name === 'AbortError') throw new Error('Cancelled by user.');
+      throw new Error('Could not open drive picker: ' + e.message);
+    }
+
+    const name = dirHandle.name.toUpperCase();
+    if (!name.includes('NICENANO') && !name.includes('NRF52BOOT') && !name.includes('BOOT')) {
+      const confirmed = confirm(
+        `Selected drive "${dirHandle.name}" does not look like a NICENANO bootloader drive.\n\nContinue anyway?`
+      );
+      if (!confirmed) throw new Error('Flash cancelled — wrong drive selected.');
+    }
+
+    const fileHandle = await dirHandle.getFileHandle('zmk.uf2', { create: true });
+    const writable   = await fileHandle.createWritable();
+    await writable.write(uf2Buffer);
+    await writable.close();
+    return true;
   }
 
   // ════════════════════════════════════════
@@ -249,12 +321,10 @@ const Flash = (() => {
   }
 
   // ════════════════════════════════════════
-  //  INIT — no localStorage restore needed (config is hardcoded)
+  //  INIT
   // ════════════════════════════════════════
 
   function init() {
-    // Config comes from js/config.js → SPAD_CONFIG
-    // Nothing to restore from localStorage
     console.log('[Flash] Ready —', SPAD_CONFIG.owner + '/' + SPAD_CONFIG.repo);
   }
 
