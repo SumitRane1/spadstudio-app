@@ -1,10 +1,6 @@
 // ═══ GITHUB FLASH — Real GitHub API integration ═══
-// Flow: generate keymap → push to repo branch →
-//       wait for Actions build → download .uf2 → flash to device
-
 const GitHubFlash = (() => {
 
-  // ── Config ──
   let _config = {
     workerUrl:  SPAD_CONFIG.workerUrl,
     owner:      SPAD_CONFIG.owner,
@@ -13,7 +9,6 @@ const GitHubFlash = (() => {
     keymapPath: 'config/boards/shields/macropad/macropad.keymap',
   };
 
-  // ── Job state ──
   let _job = {
     branchName: null,
     runId:      null,
@@ -24,10 +19,6 @@ const GitHubFlash = (() => {
 
   let _progressCallback = null;
   let _pollTimer = null;
-
-  // ════════════════════════════════════════
-  //  PUBLIC API
-  // ════════════════════════════════════════
 
   function configure(cfg) { _config = { ..._config, ...cfg }; }
   function getConfig()    { return { ..._config }; }
@@ -265,7 +256,6 @@ const GitHubFlash = (() => {
 
     console.log('[GitHubFlash] Artifact found:', artifact.name, artifact.id);
 
-    // Worker handles the GitHub redirect and streams the ZIP back
     const zipRes = await fetch(
       `${_config.workerUrl}/repos/${_config.owner}/${_config.repo}/actions/artifacts/${artifact.id}/zip`,
       { headers: _headers() }
@@ -283,57 +273,33 @@ const GitHubFlash = (() => {
     return await _extractUf2FromZip(zipBuffer);
   }
 
+  // ── Uses fflate library for reliable ZIP decompression ──
   async function _extractUf2FromZip(zipBuffer) {
-    const view  = new DataView(zipBuffer);
-    const bytes = new Uint8Array(zipBuffer);
-    const LOCAL_HEADER_SIG = 0x04034b50;
+    return new Promise((resolve, reject) => {
+      try {
+        const bytes = new Uint8Array(zipBuffer);
 
-    let offset = 0;
-    while (offset < bytes.length - 30) {
-      const sig = view.getUint32(offset, true);
-      if (sig !== LOCAL_HEADER_SIG) { offset++; continue; }
-
-      const compressionMethod = view.getUint16(offset + 8,  true);
-      const compressedSize    = view.getUint32(offset + 18, true);
-      const fileNameLength    = view.getUint16(offset + 26, true);
-      const extraLength       = view.getUint16(offset + 28, true);
-      const fileName          = new TextDecoder().decode(
-        bytes.slice(offset + 30, offset + 30 + fileNameLength)
-      );
-      const dataOffset = offset + 30 + fileNameLength + extraLength;
-
-      if (fileName.endsWith('.uf2')) {
-        const compressedData = bytes.slice(dataOffset, dataOffset + compressedSize);
-
-        if (compressionMethod === 0) {
-          return compressedData.buffer;
-        } else if (compressionMethod === 8) {
-          const ds     = new DecompressionStream('deflate-raw');
-          const writer = ds.writable.getWriter();
-          const reader = ds.readable.getReader();
-          writer.write(compressedData);
-          writer.close();
-
-          const chunks = [];
-          let totalSize = 0;
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-            totalSize += value.length;
+        // Use fflate to unzip
+        fflate.unzip(bytes, (err, unzipped) => {
+          if (err) {
+            reject(new Error('ZIP extraction failed: ' + err.message));
+            return;
           }
 
-          const result = new Uint8Array(totalSize);
-          let pos = 0;
-          for (const chunk of chunks) { result.set(chunk, pos); pos += chunk.length; }
-          return result.buffer;
-        }
+          // Find the .uf2 file
+          const uf2Key = Object.keys(unzipped).find(k => k.endsWith('.uf2'));
+          if (!uf2Key) {
+            reject(new Error('zmk.uf2 not found in build artifact ZIP. Files: ' + Object.keys(unzipped).join(', ')));
+            return;
+          }
+
+          console.log('[GitHubFlash] Extracted:', uf2Key, unzipped[uf2Key].byteLength, 'bytes');
+          resolve(unzipped[uf2Key].buffer);
+        });
+      } catch (e) {
+        reject(new Error('ZIP parse error: ' + e.message));
       }
-
-      offset = dataOffset + compressedSize;
-    }
-
-    throw new Error('zmk.uf2 not found in build artifact ZIP.');
+    });
   }
 
   async function _deleteBranch(branchName) {
@@ -351,10 +317,6 @@ const GitHubFlash = (() => {
       return { valid: false, error: e.message };
     }
   }
-
-  // ════════════════════════════════════════
-  //  UTILS
-  // ════════════════════════════════════════
 
   function _progress(pct, message) {
     _job.status = pct < 100 ? 'building' : 'done';
