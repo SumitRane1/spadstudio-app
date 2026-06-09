@@ -1,4 +1,4 @@
-// ═══ FLASH — GitHub API + File System Access API ═══
+// ═══ FLASH — GitHub API + WebUSB ═══
 
 const Flash = (() => {
 
@@ -15,6 +15,7 @@ const Flash = (() => {
 
     const { buildMode } = State.get();
     const isInstant     = buildMode === 'instant';
+    const webusbOk      = WebUSBFlash.isSupported();
 
     container.innerHTML = `
       <div class="flash-panel">
@@ -30,6 +31,16 @@ const Flash = (() => {
           </div>
         </div>
 
+        ${!webusbOk ? `
+        <div class="flash-mode-card" style="border-color:var(--color-warning);">
+          <div class="flash-mode-title">⚠️ Browser not supported</div>
+          <div class="flash-mode-desc">
+            WebUSB requires <strong>Chrome or Edge</strong>. Firefox and Safari are not supported.
+            Please switch browsers to flash firmware.
+          </div>
+        </div>
+        ` : ''}
+
         <!-- ── Instant Flash ── -->
         <div class="flash-mode-card ${isInstant ? 'available' : 'unavailable'}" id="card-instant">
           <div class="flash-mode-title">
@@ -40,13 +51,13 @@ const Flash = (() => {
           </div>
           <div class="flash-mode-desc">
             ${isInstant
-              ? 'Only key bindings changed. Flashes the pre-built base firmware directly to your NICENANO drive. Takes about 3 seconds.'
+              ? 'Only key bindings changed. Flashes the pre-built base firmware directly. Takes about 3 seconds.'
               : 'You changed encoder or layer structure — a full compile is required. Use Full Compile below.'}
           </div>
           ${isInstant ? `
             <div class="flash-instructions">
               <span>1.</span> Double-tap reset on your macropad<br>
-              <span>2.</span> NICENANO drive appears on your PC<br>
+              <span>2.</span> Wait for bootloader mode (LED pulses)<br>
               <span>3.</span> Click Flash — Chrome / Edge only
             </div>
             <div class="progress-wrap hidden" id="instant-progress">
@@ -55,7 +66,7 @@ const Flash = (() => {
               </div>
               <div class="progress-step-label" id="instant-step">Preparing…</div>
             </div>
-            <button class="btn btn-success btn-lg btn-full" id="btn-instant-flash">
+            <button class="btn btn-success btn-lg btn-full" id="btn-instant-flash" ${!webusbOk ? 'disabled' : ''}>
               ⚡ Flash to Device
             </button>
           ` : ''}
@@ -69,7 +80,7 @@ const Flash = (() => {
           </div>
           <div class="flash-mode-desc">
             Pushes your keymap to GitHub and triggers a ZMK Actions build.
-            Once compiled, click <strong>Flash Device</strong> to write firmware.
+            Once compiled, click <strong>Flash Device</strong> to write firmware via WebUSB.
           </div>
 
           <div class="progress-wrap hidden" id="compile-progress">
@@ -79,9 +90,8 @@ const Flash = (() => {
             <div class="progress-step-label" id="compile-step">Waiting…</div>
           </div>
 
-          <!-- TWO BUTTONS: Compile + Flash -->
           <div class="flash-btn-row">
-            <button class="btn btn-primary btn-lg" id="btn-compile" style="flex:1;">
+            <button class="btn btn-primary btn-lg" id="btn-compile" style="flex:1;" ${!webusbOk ? 'disabled' : ''}>
               🔨 Compile
             </button>
             <button class="btn btn-success btn-lg" id="btn-flash-device" style="flex:1;" disabled>
@@ -93,7 +103,7 @@ const Flash = (() => {
           </div>
           <p class="flash-hint">
             Step 1: Click <strong>Compile</strong> to build firmware (3–5 min).<br>
-            Step 2: Double-tap reset on device → click <strong>Flash Device</strong>.
+            Step 2: Double-tap reset on device → click <strong>Flash Device</strong> → select nice!nano from popup.
           </p>
         </div>
 
@@ -131,7 +141,7 @@ const Flash = (() => {
     // ── Compile only ──
     document.getElementById('btn-compile')?.addEventListener('click', _onCompile);
 
-    // ── Flash device (called AFTER compile, directly on button click = user gesture) ──
+    // ── Flash device — direct click = fresh user gesture for WebUSB picker ──
     document.getElementById('btn-flash-device')?.addEventListener('click', _onFlashDevice);
 
     // ── Cancel compile ──
@@ -179,8 +189,11 @@ const Flash = (() => {
         (pct, msg) => _setProgress('instant', pct, msg)
       );
 
-      _setProgress('instant', 70, 'Opening device picker…');
-      await _writeToDevice(uf2Buffer);
+      // WebUSB flash — called directly in click handler ✅
+      _setProgress('instant', 55, 'Select your nice!nano from the popup…');
+      await WebUSBFlash.flash(uf2Buffer,
+        (pct, msg) => _setProgress('instant', 55 + Math.floor(pct * 0.45), msg)
+      );
 
       _setProgress('instant', 100, '✅ Flash complete!');
       App.showToast('Firmware flashed! ✅', 'success');
@@ -203,9 +216,9 @@ const Flash = (() => {
     _isBusy    = true;
     _uf2Buffer = null;
 
-    const compileBtn    = document.getElementById('btn-compile');
-    const flashBtn      = document.getElementById('btn-flash-device');
-    const cancelBtn     = document.getElementById('btn-cancel-compile');
+    const compileBtn = document.getElementById('btn-compile');
+    const flashBtn   = document.getElementById('btn-flash-device');
+    const cancelBtn  = document.getElementById('btn-cancel-compile');
 
     if (compileBtn) compileBtn.disabled = true;
     if (flashBtn)   flashBtn.disabled   = true;
@@ -221,8 +234,8 @@ const Flash = (() => {
         (pct, msg) => _setProgress('compile', pct, msg)
       );
 
-      _setProgress('compile', 100, '✅ Firmware ready! Now click Flash Device.');
-      App.showToast('Compiled! Click ⚡ Flash Device to write firmware.', 'success');
+      _setProgress('compile', 100, '✅ Firmware ready! Double-tap reset → click Flash Device.');
+      App.showToast('Compiled! Double-tap reset then click ⚡ Flash Device.', 'success');
 
       // Enable flash button
       if (flashBtn) flashBtn.disabled = false;
@@ -240,7 +253,7 @@ const Flash = (() => {
   }
 
   // ════════════════════════════════════════
-  //  FLASH DEVICE (separate button — direct user gesture)
+  //  FLASH DEVICE (WebUSB — direct click = fresh user gesture ✅)
   // ════════════════════════════════════════
 
   async function _onFlashDevice() {
@@ -253,10 +266,13 @@ const Flash = (() => {
     if (flashBtn) flashBtn.disabled = true;
 
     try {
-      // showDirectoryPicker called DIRECTLY in click handler = user gesture ✅
-      await _writeToDevice(_uf2Buffer);
+      // WebUSBFlash.flash() calls navigator.usb.requestDevice() internally
+      // This is a direct click handler so user gesture is active ✅
+      await WebUSBFlash.flash(_uf2Buffer,
+        (pct, msg) => _setProgress('compile', pct, msg)
+      );
 
-      _setProgress('compile', 100, '✅ Firmware flashed!');
+      _setProgress('compile', 100, '✅ Firmware flashed! Device rebooting…');
       App.showToast('Firmware flashed! ✅', 'success');
 
       // Mark state clean
@@ -264,41 +280,10 @@ const Flash = (() => {
       _uf2Buffer = null;
 
     } catch (err) {
+      _setProgress('compile', 0, `❌ ${err.message}`);
       App.showToast(err.message, 'error');
-      if (flashBtn) flashBtn.disabled = false; // re-enable so user can retry
+      if (flashBtn) flashBtn.disabled = false; // re-enable for retry
     }
-  }
-
-  // ════════════════════════════════════════
-  //  WRITE TO DEVICE (folder picker — called only from click handlers)
-  // ════════════════════════════════════════
-
-  async function _writeToDevice(uf2Buffer) {
-    if (!('showDirectoryPicker' in window)) {
-      throw new Error('File System Access API not supported. Use Chrome or Edge.');
-    }
-
-    let dirHandle;
-    try {
-      dirHandle = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'desktop' });
-    } catch (e) {
-      if (e.name === 'AbortError') throw new Error('Cancelled by user.');
-      throw new Error('Could not open drive picker: ' + e.message);
-    }
-
-    const name = dirHandle.name.toUpperCase();
-    if (!name.includes('NICENANO') && !name.includes('NRF52BOOT') && !name.includes('BOOT')) {
-      const confirmed = confirm(
-        `Selected drive "${dirHandle.name}" does not look like a NICENANO bootloader drive.\n\nContinue anyway?`
-      );
-      if (!confirmed) throw new Error('Flash cancelled — wrong drive selected.');
-    }
-
-    const fileHandle = await dirHandle.getFileHandle('zmk.uf2', { create: true });
-    const writable   = await fileHandle.createWritable();
-    await writable.write(uf2Buffer);
-    await writable.close();
-    return true;
   }
 
   // ════════════════════════════════════════
@@ -312,11 +297,13 @@ const Flash = (() => {
 
     if (!wrap) return;
     wrap.classList.remove('hidden');
-    if (bar)   bar.style.width   = Math.max(0, pct) + '%';
-    if (label) label.textContent = message;
+    if (bar)   bar.style.width      = Math.max(0, Math.min(100, pct)) + '%';
+    if (label) label.textContent    = message;
 
     if (pct === 0 && message.startsWith('❌')) {
       if (bar) bar.style.background = 'var(--color-error)';
+    } else {
+      if (bar) bar.style.background = '';
     }
   }
 
