@@ -224,9 +224,12 @@ const GitHubFlash = (() => {
   }
 
 
+  // FIX: Always fetch SHA from main (stable), not the newly created build branch.
+  // Querying the fresh branch immediately after creation returns a stale/mismatched
+  // SHA due to GitHub's internal propagation delay → causes 409 Conflict on PUT.
   async function _getFileSHA(branchName) {
     try {
-      const data = await _apiGet(`/contents/${_config.keymapPath}?ref=${branchName}`);
+      const data = await _apiGet(`/contents/${_config.keymapPath}?ref=${_config.branch}`);
       return data.sha;
     } catch (e) { return null; }
   }
