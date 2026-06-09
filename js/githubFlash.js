@@ -6,7 +6,7 @@ const GitHubFlash = (() => {
 
   // ── Config ──
   let _config = {
-    token:      SPAD_CONFIG.token,
+    workerUrl:  SPAD_CONFIG.workerUrl,
     owner:      SPAD_CONFIG.owner,
     repo:       SPAD_CONFIG.repo,
     branch:     'main',
@@ -31,7 +31,7 @@ const GitHubFlash = (() => {
 
   function configure(cfg) { _config = { ..._config, ...cfg }; }
   function getConfig()    { return { ..._config }; }
-  function isConfigured() { return !!(_config.token && _config.owner && _config.repo); }
+  function isConfigured() { return !!(_config.workerUrl && _config.owner && _config.repo); }
 
   async function buildAndFlash(onProgress) {
     _progressCallback = onProgress || (() => {});
@@ -133,7 +133,6 @@ const GitHubFlash = (() => {
 
   function _headers() {
     return {
-      'Authorization':        `Bearer ${_config.token}`,
       'Accept':               'application/vnd.github+json',
       'Content-Type':         'application/json',
       'X-GitHub-Api-Version': '2022-11-28',
@@ -141,7 +140,7 @@ const GitHubFlash = (() => {
   }
 
   function _apiUrl(path) {
-    return `https://api.github.com/repos/${_config.owner}/${_config.repo}${path}`;
+    return `${_config.workerUrl}/repos/${_config.owner}/${_config.repo}${path}`;
   }
 
   async function _apiGet(path) {
@@ -254,9 +253,7 @@ const GitHubFlash = (() => {
     throw new Error('Build timed out after 10 minutes.');
   }
 
-  // ── FIXED: Download .uf2 artifact — handles GitHub's redirect correctly ──
   async function _downloadArtifact(runId) {
-    // Step 1 — list artifacts
     const data = await _apiGet(`/actions/runs/${runId}/artifacts`);
     if (!data.artifacts || data.artifacts.length === 0) {
       throw new Error('No artifacts found. Build may have failed.');
@@ -268,36 +265,13 @@ const GitHubFlash = (() => {
 
     console.log('[GitHubFlash] Artifact found:', artifact.name, artifact.id);
 
-    // Step 2 — request download URL (GitHub returns 302 redirect to CDN)
-    const redirectRes = await fetch(
-      `https://api.github.com/repos/${_config.owner}/${_config.repo}/actions/artifacts/${artifact.id}/zip`,
-      {
-        headers:  _headers(),
-        redirect: 'manual',   // capture redirect, don't follow
-      }
+    // Worker handles the GitHub redirect and streams the ZIP back
+    const zipRes = await fetch(
+      `${_config.workerUrl}/repos/${_config.owner}/${_config.repo}/actions/artifacts/${artifact.id}/zip`,
+      { headers: _headers() }
     );
 
-    // Step 3 — extract CDN URL from Location header
-    let downloadUrl;
-    if (redirectRes.status === 302 || redirectRes.status === 301) {
-      downloadUrl = redirectRes.headers.get('Location');
-    } else if (redirectRes.ok) {
-      // Some environments auto-follow redirect
-      const zipBuffer = await redirectRes.arrayBuffer();
-      return await _extractUf2FromZip(zipBuffer);
-    } else {
-      throw new Error(`Artifact download failed: ${redirectRes.status}`);
-    }
-
-    if (!downloadUrl) {
-      throw new Error('GitHub did not return a download URL for the artifact.');
-    }
-
-    console.log('[GitHubFlash] Downloading from CDN…');
-
-    // Step 4 — fetch actual ZIP from CDN (no auth header needed)
-    const zipRes = await fetch(downloadUrl);
-    if (!zipRes.ok) throw new Error(`CDN download failed: ${zipRes.status}`);
+    if (!zipRes.ok) throw new Error(`Artifact download failed: ${zipRes.status}`);
 
     const zipBuffer = await zipRes.arrayBuffer();
     console.log('[GitHubFlash] ZIP size:', zipBuffer.byteLength, 'bytes');
@@ -309,7 +283,6 @@ const GitHubFlash = (() => {
     return await _extractUf2FromZip(zipBuffer);
   }
 
-  // ── Unzip artifact and extract zmk.uf2 ──
   async function _extractUf2FromZip(zipBuffer) {
     const view  = new DataView(zipBuffer);
     const bytes = new Uint8Array(zipBuffer);
@@ -333,10 +306,8 @@ const GitHubFlash = (() => {
         const compressedData = bytes.slice(dataOffset, dataOffset + compressedSize);
 
         if (compressionMethod === 0) {
-          // Stored — no compression
           return compressedData.buffer;
         } else if (compressionMethod === 8) {
-          // Deflate
           const ds     = new DecompressionStream('deflate-raw');
           const writer = ds.writable.getWriter();
           const reader = ds.readable.getReader();
@@ -371,8 +342,8 @@ const GitHubFlash = (() => {
 
   async function verifyToken() {
     try {
-      const res = await fetch('https://api.github.com/user', { headers: _headers() });
-      if (!res.ok) throw new Error('Invalid token or no access');
+      const res = await fetch(`${_config.workerUrl}/user`, { headers: _headers() });
+      if (!res.ok) throw new Error('Worker not reachable');
       const user = await res.json();
       await _apiGet('');
       return { valid: true, username: user.login, avatar: user.avatar_url };
