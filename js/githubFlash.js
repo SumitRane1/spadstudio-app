@@ -224,7 +224,7 @@ const GitHubFlash = (() => {
   }
 
 
-  // FIX: Always fetch SHA from main (stable), not the newly created build branch.
+  // Always fetch SHA from main (stable), not the newly created build branch.
   // Querying the fresh branch immediately after creation returns a stale/mismatched
   // SHA due to GitHub's internal propagation delay → causes 409 Conflict on PUT.
   async function _getFileSHA(branchName) {
@@ -296,7 +296,9 @@ const GitHubFlash = (() => {
   }
 
 
-  // ── Download ZIP → extract .uf2 via Central Directory → decompress → validate ──
+  // ── Download artifact → Worker extracts .uf2 and returns raw bytes ──
+  // The Cloudflare Worker handles ZIP extraction server-side.
+  // This function receives raw UF2 bytes directly — no ZIP parsing needed here.
   async function _downloadArtifact(runId) {
     const data = await _apiGet(`/actions/runs/${runId}/artifacts`);
     if (!data.artifacts || data.artifacts.length === 0) {
@@ -305,7 +307,7 @@ const GitHubFlash = (() => {
 
     console.log('[GitHubFlash] All artifacts:', data.artifacts.map(a => `${a.name}(${a.id})`).join(', '));
 
-    // Prefer firmware-stored (uncompressed repack) → fallback to firmware
+    // Prefer firmware-stored → fallback to firmware
     const artifact =
       data.artifacts.find(a => a.name === 'firmware-stored') ||
       data.artifacts.find(a => a.name === 'firmware')        ||
@@ -313,136 +315,32 @@ const GitHubFlash = (() => {
 
     console.log('[GitHubFlash] Using artifact:', artifact.name, artifact.id);
 
-    const uf2Res = await fetch(
+    const res = await fetch(
       `${_config.workerUrl}/repos/${_config.owner}/${_config.repo}/actions/artifacts/${artifact.id}/zip`,
       { headers: _headers() }
     );
 
-    if (!uf2Res.ok) {
-      const err = await uf2Res.json().catch(() => ({}));
-      throw new Error(`Firmware download failed: ${uf2Res.status} ${err.error || ''}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(`Firmware download failed: ${res.status} ${err.error || ''}`);
     }
 
-    const zipBytes = new Uint8Array(await uf2Res.arrayBuffer());
-    console.log('[GitHubFlash] ZIP downloaded, size:', zipBytes.length, 'bytes');
+    // Worker extracts the .uf2 from the ZIP and returns raw bytes
+    const buf = await res.arrayBuffer();
+    console.log('[GitHubFlash] Received', buf.byteLength, 'bytes from Worker');
 
-    // Extract .uf2 using Central Directory (reliable — handles streamed ZIPs with compSize=0 in local headers)
-    const uf2Bytes = await _extractUf2FromZip(zipBytes);
-    console.log('[GitHubFlash] UF2 extracted, size:', uf2Bytes.length, 'bytes');
-
-    if (uf2Bytes.length < 512) {
-      throw new Error('UF2 too small — extraction failed.');
+    if (buf.byteLength < 512) {
+      throw new Error('Response too small — Worker may have failed to extract UF2.');
     }
 
     // Validate UF2 magic bytes: "UF2\n" (0x0A324655) + 0x9E5D5157
-    const dv = new DataView(uf2Bytes.buffer);
+    const dv = new DataView(buf);
     if (dv.getUint32(0, true) !== 0x0A324655 || dv.getUint32(4, true) !== 0x9E5D5157) {
-      throw new Error('Invalid UF2 magic bytes — extracted file is not valid firmware.');
+      throw new Error('Invalid UF2 magic bytes — Worker returned bad data.');
     }
 
     console.log('[GitHubFlash] UF2 magic valid ✓');
-    return uf2Bytes.buffer; // ArrayBuffer for writeToDevice
-  }
-
-
-  // ── ZIP extractor using Central Directory ──
-  // Parses from the END of the ZIP (Central Directory) for reliable compSize/offset values.
-  // GitHub Actions ZIPs use streaming mode where local file headers have compSize=0,
-  // making forward-walking parsers fail. The Central Directory always has correct values.
-  async function _extractUf2FromZip(zipBytes) {
-    const view = new DataView(zipBytes.buffer);
-    const len  = zipBytes.length;
-
-    // ── Step 1: Find End of Central Directory (EOCD) record ──
-    // Signature: PK\x05\x06 = 0x06054b50, scan backwards from end of file
-    let eocdOffset = -1;
-    for (let i = len - 22; i >= Math.max(0, len - 65558); i--) {
-      if (view.getUint32(i, true) === 0x06054b50) {
-        eocdOffset = i;
-        break;
-      }
-    }
-    if (eocdOffset === -1) throw new Error('ZIP: End of Central Directory record not found.');
-
-    const cdCount  = view.getUint16(eocdOffset + 8,  true); // total entries
-    const cdOffset = view.getUint32(eocdOffset + 16, true); // offset of central directory
-    console.log(`[GitHubFlash] ZIP EOCD found at ${eocdOffset} | entries: ${cdCount} | CD offset: ${cdOffset}`);
-
-    // ── Step 2: Walk Central Directory entries ──
-    let cdPos = cdOffset;
-    for (let i = 0; i < cdCount; i++) {
-      if (view.getUint32(cdPos, true) !== 0x02014b50) {
-        throw new Error(`ZIP: Expected Central Directory signature at offset ${cdPos}, got 0x${view.getUint32(cdPos, true).toString(16)}`);
-      }
-
-      const compression  = view.getUint16(cdPos + 10, true); // 0=stored, 8=deflate
-      const compSize     = view.getUint32(cdPos + 20, true); // compressed size (always correct here)
-      const uncompSize   = view.getUint32(cdPos + 24, true); // uncompressed size
-      const fileNameLen  = view.getUint16(cdPos + 28, true);
-      const extraLen     = view.getUint16(cdPos + 30, true);
-      const commentLen   = view.getUint16(cdPos + 32, true);
-      const localOffset  = view.getUint32(cdPos + 42, true); // offset of local file header
-
-      const fileName = new TextDecoder().decode(
-        zipBytes.slice(cdPos + 46, cdPos + 46 + fileNameLen)
-      );
-      console.log(`[GitHubFlash] Entry ${i}: "${fileName}" | method:${compression} | comp:${compSize} | uncomp:${uncompSize} | localOffset:${localOffset}`);
-
-      if (fileName.endsWith('.uf2')) {
-        // ── Step 3: Use local file header only for dataStart offset ──
-        // (local header has correct fileNameLen/extraLen even if compSize=0 there)
-        if (view.getUint32(localOffset, true) !== 0x04034b50) {
-          throw new Error(`ZIP: Invalid local file header signature at offset ${localOffset}`);
-        }
-        const localFileNameLen = view.getUint16(localOffset + 26, true);
-        const localExtraLen    = view.getUint16(localOffset + 28, true);
-        const dataStart        = localOffset + 30 + localFileNameLen + localExtraLen;
-
-        console.log(`[GitHubFlash] UF2 data at offset ${dataStart}, reading ${compSize} bytes`);
-
-        // Use compSize from Central Directory (reliable), not local header
-        const compData = zipBytes.slice(dataStart, dataStart + compSize);
-
-        if (compression === 0) {
-          // Stored — no compression, raw bytes
-          console.log('[GitHubFlash] UF2 stored uncompressed, size:', compData.length);
-          return compData;
-        }
-
-        if (compression === 8) {
-          // Deflate — decompress with browser's built-in DecompressionStream
-          console.log('[GitHubFlash] UF2 Deflate-compressed, decompressing…');
-          const ds     = new DecompressionStream('deflate-raw');
-          const writer = ds.writable.getWriter();
-          const reader = ds.readable.getReader();
-
-          writer.write(compData);
-          writer.close();
-
-          const chunks = [];
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-          }
-
-          const totalLen = chunks.reduce((n, c) => n + c.length, 0);
-          const result   = new Uint8Array(totalLen);
-          let pos = 0;
-          for (const chunk of chunks) { result.set(chunk, pos); pos += chunk.length; }
-
-          console.log('[GitHubFlash] Decompressed UF2 size:', result.length, 'bytes');
-          return result;
-        }
-
-        throw new Error(`ZIP: Unsupported compression method ${compression} — expected 0 (stored) or 8 (deflate).`);
-      }
-
-      // Advance to next Central Directory entry
-      cdPos += 46 + fileNameLen + extraLen + commentLen;
-    }
-
-    throw new Error('No .uf2 file found inside the ZIP artifact. Check the GitHub Actions build output.');
+    return buf;
   }
 
 
