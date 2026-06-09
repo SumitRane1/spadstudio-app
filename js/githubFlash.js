@@ -247,20 +247,23 @@ const GitHubFlash = (() => {
     throw new Error('Build timed out after 10 minutes.');
   }
 
-  // ── Worker downloads ZIP, unzips it, returns raw .uf2 bytes ──
+  // ── Worker downloads ZIP, unzips, returns raw .uf2 bytes ──
   async function _downloadArtifact(runId) {
     const data = await _apiGet(`/actions/runs/${runId}/artifacts`);
     if (!data.artifacts || data.artifacts.length === 0) {
       throw new Error('No artifacts found. Build may have failed.');
     }
 
-    const artifact = data.artifacts.find(a =>
-      a.name === 'firmware' || a.name.includes('zmk') || a.name.includes('firmware')
-    ) || data.artifacts[0];
+    console.log('[GitHubFlash] All artifacts:', data.artifacts.map(a => `${a.name}(${a.id})`).join(', '));
 
-    console.log('[GitHubFlash] Artifact found:', artifact.name, artifact.id);
+    // Prefer firmware-stored (uncompressed repack) → fallback to firmware
+    const artifact =
+      data.artifacts.find(a => a.name === 'firmware-stored') ||
+      data.artifacts.find(a => a.name === 'firmware')        ||
+      data.artifacts[0];
 
-    // Worker handles download + unzip — browser receives raw .uf2
+    console.log('[GitHubFlash] Using artifact:', artifact.name, artifact.id);
+
     const uf2Res = await fetch(
       `${_config.workerUrl}/repos/${_config.owner}/${_config.repo}/actions/artifacts/${artifact.id}/zip`,
       { headers: _headers() }
