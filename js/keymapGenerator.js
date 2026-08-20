@@ -1,47 +1,36 @@
-// ═══ KEYMAP GENERATOR (CORRECTED) ═══
-// Converts app State → valid ZMK .keymap source string
-//
-// KEY FIX vs previous version:
-//   - Encoder modes are now INDEPENDENT of content layers (not tied to layerIndex).
-//   - Encoder push button now generates REAL bindings (tog/macro), not &trans.
-//   - Content-layer cap raised and decoupled from hardware matrix rows/cols
-//     (matrix-transform rows/cols is a HARDWARE concept, unrelated to how many
-//     keymap layers ZMK can hold).
+// ═══ KEYMAP GENERATOR ═══
+// Converts app State → valid ZMK .keymap source string.
 //
 // Architecture:
-//   - User-defined "content" layers (0..C-1) are cycled by the FN button only.
-//   - Encoder modes (scroll/volume/brightness/...) are cycled by the encoder
-//     push button only, via extra "overlay" layers appended AFTER all content
-//     layers. The first mode (scroll) needs no overlay layer — it's just
-//     whichever content layer's own sensor-bindings apply by default.
-//   - Overlay layers have every matrix key + FN key set to &trans, so content
-//     layers "show through" — only sensor-bindings differ. This guarantees
-//     FN and the encoder never interfere with each other.
+// - Content layers are cycled by FN using &tog transition macros.
+// - Encoder modes are independent overlays after content layers.
+// - Scroll is the baseline mode; volume and brightness get overlay layers.
+// - FN transition macros never use &to, so they do NOT disable encoder overlays.
 
 const KeymapGenerator = (() => {
 
-  const MAX_CONTENT_LAYERS = 6; // arbitrary practical cap, NOT a hardware limit
+  const MAX_CONTENT_LAYERS = 6;
   const KEYS_PER_LAYER = 9;
 
   // ── ZMK behavior prefix resolver ──
   function _resolveBinding(code) {
     if (!code || code === 'TRANS' || code === 'trans') return '&trans';
-    if (code === 'NONE'  || code === 'none')  return '&none';
+    if (code === 'NONE' || code === 'none') return '&none';
 
-    const lower = code.toLowerCase().trim();
+    const value = String(code).trim();
+    const lower = value.toLowerCase();
 
-    if (lower.startsWith('tog '))  return `&tog ${code.split(' ')[1]}`;
-    if (lower.startsWith('to '))   return `&to ${code.split(' ')[1]}`;
-    if (lower.startsWith('mo '))   return `&mo ${code.split(' ')[1]}`;
-    if (lower.startsWith('lt '))   return `&lt ${code.slice(3)}`;
-    if (lower.startsWith('mt '))   return `&mt ${code.slice(3)}`;
+    if (lower.startsWith('tog ')) return `&tog ${value.split(/\s+/)[1]}`;
+    if (lower.startsWith('to ')) return `&to ${value.split(/\s+/)[1]}`;
+    if (lower.startsWith('mo ')) return `&mo ${value.split(/\s+/)[1]}`;
+    if (lower.startsWith('lt ')) return `&lt ${value.slice(3)}`;
+    if (lower.startsWith('mt ')) return `&mt ${value.slice(3)}`;
+    if (lower.startsWith('macro_')) return `&${value}`;
 
-    if (lower.startsWith('macro_')) return `&${code}`;
-
-    return `&kp ${code}`;
+    return `&kp ${value}`;
   }
 
-  function _normalizeKeys(keys) {
+  function _normalizeKeys(keys = []) {
     const result = [...keys].slice(0, KEYS_PER_LAYER);
     while (result.length < KEYS_PER_LAYER) result.push('TRANS');
     return result;
@@ -51,7 +40,7 @@ const KeymapGenerator = (() => {
     const lines = [];
     for (let i = 0; i < bindings.length; i += 3) {
       const row = bindings.slice(i, i + 3)
-        .map(b => b.padEnd(22))
+        .map(binding => binding.padEnd(22))
         .join(' ');
       lines.push(`${indent}${row.trimEnd()}`);
     }
@@ -59,252 +48,259 @@ const KeymapGenerator = (() => {
   }
 
   function _layerLabel(name, index) {
-    const safe = (name || `layer_${index}`)
+    return (name || `layer_${index}`)
       .toLowerCase()
       .replace(/[^a-z0-9_]/g, '_')
       .replace(/^[0-9]/, '_$&');
-    return safe;
   }
 
-  // ── Build the list of encoder modes from state.encoder ──
-  // First mode = baseline (no overlay layer needed).
-  // Every mode after the first gets one dedicated overlay layer.
-  function _getEncoderModes(encoder) {
+  function _getEncoderModes(encoder = {}) {
     const order = ['scroll', 'volume', 'brightness'];
+
     return order
-      .filter(m => encoder[m] && encoder[m].cw && encoder[m].ccw)
-      .map(m => ({ name: m, cw: encoder[m].cw, ccw: encoder[m].ccw }));
+      .filter(mode => encoder[mode] && encoder[mode].cw && encoder[mode].ccw)
+      .map(mode => ({
+        name: mode,
+        cw: encoder[mode].cw,
+        ccw: encoder[mode].ccw,
+      }));
   }
 
-  // ── Generate macro blocks for multi-step encoder transitions ──
-  // Any transition that must turn OFF the current overlay AND turn ON the
-  // next one in a single button press requires a macro (single tog isn't
-  // enough for 3+ modes).
-  function _generateEncoderMacros(modes, contentLayerCount) {
-    if (modes.length <= 1) return { block: '', macroNames: [] };
+  // ── Generate FN macros ──
+  // IMPORTANT: We intentionally use &tog, not &to.
+  // &to disables every active layer except the default layer, which would
+  // reset a currently active encoder overlay (volume/brightness).
+  function _generateFnMacros(contentLayerCount) {
+    if (contentLayerCount <= 1) return { block: '', bindings: [] };
 
-    const overlayStart = contentLayerCount; // first overlay layer index
-    const macroNames = [];
-    const blocks = [];
+    const macros = [];
+    const bindings = [];
 
-    // modes[0] = scroll (baseline, index -1 conceptually = "no overlay")
-    // modes[1] = first overlay  → layer index overlayStart
-    // modes[2] = second overlay → layer index overlayStart + 1
-    // ...
-    for (let i = 1; i < modes.length; i++) {
-      const isLast = i === modes.length - 1;
-      const currentOverlayIdx = overlayStart + (i - 1);
+    for (let current = 0; current < contentLayerCount; current++) {
+      const next = (current + 1) % contentLayerCount;
+      const id = `layer_${current}_to_layer_${next}`;
 
-      if (isLast) continue; // last mode just needs a plain &tog off, no macro
+      macros.push(`
+        ${id}: ${id} {
+            compatible = "zmk,behavior-macro";
+            #binding-cells = <0>;
+            bindings = <&tog ${current}>, <&tog ${next}>;
+        };`);
 
-      const nextOverlayIdx = overlayStart + i;
-      const macroId = `mode_${modes[i].name}_to_${modes[i + 1].name}`;
-      macroNames.push({ afterMode: i, id: macroId });
-
-      blocks.push(`
-    ${macroId}: ${macroId} {
-        compatible = "zmk,behavior-macro";
-        #binding-cells = <0>;
-        bindings = <&tog ${currentOverlayIdx}>, <&tog ${nextOverlayIdx}>;
-    };`);
+      bindings[current] = `&${id}`;
     }
 
-    const block = blocks.length
-      ? `
-    macros {
-${blocks.join('\n')}
+    return {
+      block: macros.join('\n'),
+      bindings,
     };
-`
-      : '';
-
-    return { block, macroNames };
   }
 
-  // ── User macro_ bindings inside the 9 regular keys (unchanged behavior) ──
-  function _generateUserMacros(layers) {
+  // ── Generate encoder mode transition macros ──
+  // modes[0] is baseline scroll. It needs no overlay layer.
+  // modes[1+] are overlay layers appended after content layers.
+  function _generateEncoderMacros(modes, contentLayerCount) {
+    if (modes.length <= 2) return { block: '', bindings: [] };
+
     const macros = [];
+    const bindings = [];
+
+    for (let modeIndex = 1; modeIndex < modes.length - 1; modeIndex++) {
+      const currentOverlay = contentLayerCount + (modeIndex - 1);
+      const nextOverlay = contentLayerCount + modeIndex;
+      const id = `mode_${modes[modeIndex].name}_to_${modes[modeIndex + 1].name}`;
+
+      macros.push(`
+        ${id}: ${id} {
+            compatible = "zmk,behavior-macro";
+            #binding-cells = <0>;
+            bindings = <&tog ${currentOverlay}>, <&tog ${nextOverlay}>;
+        };`);
+
+      bindings[modeIndex] = `&${id}`;
+    }
+
+    return {
+      block: macros.join('\n'),
+      bindings,
+    };
+  }
+
+  // Placeholder macro definitions for app-level macro_* key references.
+  function _generateUserMacros(layers) {
+    const found = new Map();
+
     layers.forEach(layer => {
-      layer.keys.forEach(key => {
-        if (key && key.startsWith('macro_')) {
-          if (!macros.find(m => m.id === key)) {
-            macros.push({ id: key, label: key.replace('macro_', '') });
-          }
+      (layer.keys || []).forEach(key => {
+        if (typeof key === 'string' && key.startsWith('macro_') && !found.has(key)) {
+          found.set(key, key.replace('macro_', ''));
         }
       });
     });
-    if (macros.length === 0) return '';
 
-    const blocks = macros.map(m => `
-    ${m.id}: ${m.id} {
-        compatible = "zmk,behavior-macro";
-        #binding-cells = <0>;
-        bindings = <&kp TRANS>; /* TODO: set macro steps */
-        label = "${m.label.toUpperCase()}";
-    };`).join('\n');
+    return [...found.entries()].map(([id, label]) => `
+        ${id}: ${id} {
+            compatible = "zmk,behavior-macro";
+            #binding-cells = <0>;
+            bindings = <&kp TRANS>; /* TODO: set macro steps */
+            label = "${label.toUpperCase()}";
+        };`).join('\n');
+  }
 
-    return `
+  function _buildMacrosBlock(contentLayerCount, modes, layers) {
+    const fn = _generateFnMacros(contentLayerCount);
+    const encoder = _generateEncoderMacros(modes, contentLayerCount);
+    const user = _generateUserMacros(layers);
+
+    const definitions = [fn.block, encoder.block, user].filter(Boolean).join('\n');
+
+    return {
+      block: definitions ? `
     macros {
-${blocks}
+${definitions}
     };
-`;
+` : '',
+      fnBindings: fn.bindings,
+      encoderTransitionBindings: encoder.bindings,
+    };
   }
 
-  // ── Determine push-button (encoder SW) binding for a CONTENT layer ──
-  function _pushBindingForContentLayer(modes, contentLayerCount) {
-    if (modes.length <= 1) return '&trans'; // only scroll mode exists, nothing to cycle
-    return `&tog ${contentLayerCount}`; // enter first overlay (mode index 1)
+  function _encoderPushForContent(modes, contentLayerCount) {
+    // Baseline scroll -> activate first overlay (normally volume).
+    return modes.length > 1 ? `&tog ${contentLayerCount}` : '&trans';
   }
 
-  // ── Determine push-button binding for an OVERLAY layer ──
-  function _pushBindingForOverlayLayer(modeIndex, modes, contentLayerCount, macroNames) {
-    const overlayIdx = contentLayerCount + (modeIndex - 1);
-    const isLast = modeIndex === modes.length - 1;
+  function _encoderPushForOverlay(modeIndex, modes, contentLayerCount, transitionBindings) {
+    const currentOverlay = contentLayerCount + (modeIndex - 1);
+    const lastModeIndex = modes.length - 1;
 
-    if (isLast) {
-      return `&tog ${overlayIdx}`; // turn off, falls back to baseline scroll
-    }
+    // Final overlay -> turn itself off -> return to baseline scroll.
+    if (modeIndex === lastModeIndex) return `&tog ${currentOverlay}`;
 
-    const macro = macroNames.find(m => m.afterMode === modeIndex);
-    return macro ? `&${macro.id}` : `&tog ${overlayIdx}`;
+    // Intermediate overlay -> macro toggles this one off and next one on.
+    return transitionBindings[modeIndex] || `&tog ${currentOverlay}`;
   }
 
-  // ── FN binding: round-robin through CONTENT layers only ──
-  function _fnBindingForContentLayer(index, contentLayerCount) {
-    if (contentLayerCount <= 1) return '&trans';
-    const next = (index + 1) % contentLayerCount;
-    return `&to ${next}`;
-  }
-
-  // ══════════════════════════════════════════
-  //  MAIN: generate(.keymap string)
-  // ══════════════════════════════════════════
   function generate(state) {
-    const { layers, encoder } = state;
-
+    const layers = Array.isArray(state.layers) ? state.layers : [];
+    const encoder = state.encoder || {};
     const contentLayers = layers.slice(0, MAX_CONTENT_LAYERS);
     const contentLayerCount = contentLayers.length;
-
     const modes = _getEncoderModes(encoder);
-    const { block: encoderMacroBlock, macroNames } =
-      _generateEncoderMacros(modes, contentLayerCount);
-    const userMacroBlock = _generateUserMacros(contentLayers);
 
-    // ── Build CONTENT layer blocks ──
-    const contentBlocks = contentLayers.map((layer, i) => {
-      const keys     = _normalizeKeys(layer.keys);
-      const bindings = keys.map(_resolveBinding);
+    const {
+      block: macrosBlock,
+      fnBindings,
+      encoderTransitionBindings,
+    } = _buildMacrosBlock(contentLayerCount, modes, contentLayers);
 
-      const fnBinding    = _fnBindingForContentLayer(i, contentLayerCount);
-      const encSwBinding  = _pushBindingForContentLayer(modes, contentLayerCount);
+    const baselineMode = modes[0] || { name: 'scroll', cw: 'PG_UP', ccw: 'PG_DN' };
 
-      const allBindings = [...bindings, fnBinding, encSwBinding];
+    const contentBlocks = contentLayers.map((layer, index) => {
+      const label = _layerLabel(layer.name, index);
+      const keyBindings = _normalizeKeys(layer.keys).map(_resolveBinding);
+      const fnBinding = fnBindings[index] || _resolveBinding(layer.fnAction || 'TRANS');
+      const encoderPushBinding = _encoderPushForContent(modes, contentLayerCount);
+      const formattedBindings = _formatBindingsBlock(
+        [...keyBindings, fnBinding, encoderPushBinding],
+        '                '
+      );
 
-      const label = _layerLabel(layer.name, i);
-      const bindingsFormatted = _formatBindingsBlock(allBindings, '                ');
-
-      // Baseline (scroll) sensor-binding — every content layer gets it,
-      // since scroll is the default mode with no overlay.
-      const scrollMode = modes[0] || { cw: 'PG_UP', ccw: 'PG_DN' };
-      const sensorBinding = `<&inc_dec_kp ${scrollMode.ccw} ${scrollMode.cw}>`;
-
-      return `        ${label}: layer_${i} {
+      return `        ${label}: layer_${index} {
             label = "${(layer.name || label).toUpperCase()}";
             bindings = <
-${bindingsFormatted}
+${formattedBindings}
             >;
-            sensor-bindings = ${sensorBinding};
+            sensor-bindings = <&inc_dec_kp ${baselineMode.ccw} ${baselineMode.cw}>;
         };`;
     });
 
-    // ── Build OVERLAY layer blocks (modes[1..]) ──
     const overlayBlocks = [];
-    for (let m = 1; m < modes.length; m++) {
-      const overlayIdx = contentLayerCount + (m - 1);
-      const mode = modes[m];
 
-      const transBindings = new Array(KEYS_PER_LAYER).fill('&trans');
-      const fnBinding = '&trans'; // FN never affected by encoder mode
-      const encSwBinding = _pushBindingForOverlayLayer(
-        m, modes, contentLayerCount, macroNames
+    for (let modeIndex = 1; modeIndex < modes.length; modeIndex++) {
+      const mode = modes[modeIndex];
+      const overlayIndex = contentLayerCount + (modeIndex - 1);
+      const encoderPushBinding = _encoderPushForOverlay(
+        modeIndex,
+        modes,
+        contentLayerCount,
+        encoderTransitionBindings
+      );
+      const formattedBindings = _formatBindingsBlock(
+        [
+          ...new Array(KEYS_PER_LAYER).fill('&trans'),
+          '&trans',
+          encoderPushBinding,
+        ],
+        '                '
       );
 
-      const allBindings = [...transBindings, fnBinding, encSwBinding];
-      const bindingsFormatted = _formatBindingsBlock(allBindings, '                ');
-      const sensorBinding = `<&inc_dec_kp ${mode.ccw} ${mode.cw}>`;
-      const label = `mode_${mode.name}`;
-
-      overlayBlocks.push(`        ${label}: layer_${overlayIdx} {
+      overlayBlocks.push(`        mode_${mode.name}: layer_${overlayIndex} {
             label = "MODE_${mode.name.toUpperCase()}";
             bindings = <
-${bindingsFormatted}
+${formattedBindings}
             >;
-            sensor-bindings = ${sensorBinding};
+            sensor-bindings = <&inc_dec_kp ${mode.ccw} ${mode.cw}>;
         };`);
     }
 
-    const allLayerBlocks = [...contentBlocks, ...overlayBlocks];
+    const allBlocks = [...contentBlocks, ...overlayBlocks];
     const totalLayers = contentLayerCount + Math.max(0, modes.length - 1);
 
-    const keymapContent = `/*
+    return `/*
  * ZMK Keymap — Auto-generated by sPadStudio
- * Device       : nice!nano v2 · 3×3 Macropad
- * Content Layers : ${contentLayerCount} (cycled by FN button)
- * Encoder Modes   : ${modes.map(m => m.name).join(' / ')} (cycled by encoder push, independent of FN)
+ * Device         : nice!nano v2 · 3×3 Macropad
+ * Content Layers : ${contentLayerCount} (cycled by FN)
+ * Encoder Modes  : ${modes.map(mode => mode.name).join(' / ') || 'none'} (cycled by encoder push)
  * Total ZMK Layers: ${totalLayers}
  * Generated: ${new Date().toISOString()}
  *
- * DO NOT EDIT MANUALLY — regenerate via sPadStudio
+ * FN transitions use &tog macros rather than &to, preserving encoder overlays.
  */
 
 #include <behaviors.dtsi>
 #include <dt-bindings/zmk/keys.h>
 #include <dt-bindings/zmk/outputs.h>
 / {
-${encoderMacroBlock}${userMacroBlock}
+${macrosBlock}
     keymap {
         compatible = "zmk,keymap";
 
-${allLayerBlocks.join('\n\n')}
+${allBlocks.join('\n\n')}
 
     };
-};
-`;
-
-    return keymapContent.trim();
+};`.trim();
   }
 
-  // ── Validate state before generating ──
   function validate(state) {
-    const errors   = [];
+    const errors = [];
     const warnings = [];
+    const layers = Array.isArray(state.layers) ? state.layers : [];
 
-    if (!state.layers || state.layers.length === 0) {
+    if (layers.length === 0) {
       errors.push('No layers defined.');
     }
 
-    if (state.layers.length > MAX_CONTENT_LAYERS) {
-      warnings.push(`${state.layers.length} content layers defined — only first ${MAX_CONTENT_LAYERS} will be compiled.`);
+    if (layers.length > MAX_CONTENT_LAYERS) {
+      warnings.push(`${layers.length} content layers defined — only the first ${MAX_CONTENT_LAYERS} will be compiled.`);
     }
 
-    state.layers.forEach((layer, i) => {
-      if (!layer.name || layer.name.trim() === '') {
-        warnings.push(`Layer ${i} has no name — will use "layer_${i}".`);
+    layers.slice(0, MAX_CONTENT_LAYERS).forEach((layer, index) => {
+      if (!layer.name || !layer.name.trim()) {
+        warnings.push(`Layer ${index} has no name — "layer_${index}" will be used.`);
       }
-      if (!layer.keys || layer.keys.length === 0) {
-        errors.push(`Layer ${i} ("${layer.name}") has no keys.`);
+      if (!Array.isArray(layer.keys) || layer.keys.length === 0) {
+        errors.push(`Layer ${index} ("${layer.name || `layer_${index}`}") has no keys.`);
       }
-      if (layer.keys && layer.keys.length > KEYS_PER_LAYER) {
-        warnings.push(`Layer ${i} ("${layer.name}") has ${layer.keys.length} keys — only first ${KEYS_PER_LAYER} will be used.`);
+      if (Array.isArray(layer.keys) && layer.keys.length > KEYS_PER_LAYER) {
+        warnings.push(`Layer ${index} has ${layer.keys.length} keys — only the first ${KEYS_PER_LAYER} will be used.`);
       }
     });
 
     if (!state.encoder) {
       errors.push('Encoder config missing.');
-    } else {
-      const modes = _getEncoderModes(state.encoder);
-      if (modes.length === 0) {
-        errors.push('Encoder must have at least one valid mode (scroll/volume/brightness) with CW and CCW bindings.');
-      }
+    } else if (_getEncoderModes(state.encoder).length === 0) {
+      errors.push('Encoder needs at least one complete mode with both CW and CCW bindings.');
     }
 
     return { valid: errors.length === 0, errors, warnings };
@@ -313,10 +309,16 @@ ${allLayerBlocks.join('\n\n')}
   function preview(state) {
     const result = validate(state);
     if (!result.valid) {
-      return `/* Validation errors:\n${result.errors.map(e => ' * ERROR: ' + e).join('\n')}\n */`;
+      return `/* Validation errors:\n${result.errors.map(error => ` * ERROR: ${error}`).join('\n')}\n */`;
     }
     return generate(state);
   }
 
-  return { generate, validate, preview, MAX_CONTENT_LAYERS, KEYS_PER_LAYER };
+  return {
+    generate,
+    validate,
+    preview,
+    MAX_CONTENT_LAYERS,
+    KEYS_PER_LAYER,
+  };
 })();
