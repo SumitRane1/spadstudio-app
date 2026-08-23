@@ -1,15 +1,29 @@
 // ═══ KEYMAP GENERATOR ═══
 // Converts app State → valid ZMK .keymap source string.
 //
+// ═══ FIX (2026-08-24) — MAX_CONTENT_LAYERS was 6, should be 4 ═══
+// This constant represents how many layers the USER manages directly in
+// state.layers (Media, System, Illustrator, Premiere Pro — 4 total). The
+// encoder-mode overlays (Volume, Brightness) are NOT content layers — they
+// are auto-generated below from state.encoder and appended AFTER content
+// layers, bringing the real total ZMK layer count to 6.
+//
+// Having MAX_CONTENT_LAYERS = 6 let the UI's addLayer() (state.js) create up
+// to 6 "content" layers, which made contentLayerCount wrong (6 instead of
+// 4), shifting FN transition macro indices and overlay layer indices, and
+// causing wrong bindings to land on the encoder push (e.g. an unrelated
+// Ctrl+Z firing instead of a mode-cycle macro). state.js's addLayer() now
+// also reads this constant directly to enforce the same cap at the source.
+//
 // Architecture:
-// - Content layers are cycled by FN using &tog transition macros.
+// - Content layers (max 4) are cycled by FN using &tog transition macros.
 // - Encoder modes are independent overlays after content layers.
 // - Scroll is the baseline mode; volume and brightness get overlay layers.
 // - FN transition macros never use &to, so they do NOT disable encoder overlays.
 
 const KeymapGenerator = (() => {
 
-  const MAX_CONTENT_LAYERS = 6;
+  const MAX_CONTENT_LAYERS = 4; // ★ FIX: was 6 — see header comment
   const KEYS_PER_LAYER = 9;
 
   // ── ZMK behavior prefix resolver ──
@@ -282,7 +296,7 @@ ${allBlocks.join('\n\n')}
     }
 
     if (layers.length > MAX_CONTENT_LAYERS) {
-      warnings.push(`${layers.length} content layers defined — only the first ${MAX_CONTENT_LAYERS} will be compiled.`);
+      warnings.push(`${layers.length} content layers defined — only the first ${MAX_CONTENT_LAYERS} will be compiled. Volume/Brightness modes are configured separately in the Encoder panel, not as extra layers.`);
     }
 
     layers.slice(0, MAX_CONTENT_LAYERS).forEach((layer, index) => {
