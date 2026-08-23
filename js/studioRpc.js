@@ -4,20 +4,14 @@
 //   2. Protobuf ENCODE/DECODE of Request/Response messages
 //   3. A request/response promise-matching layer keyed by request_id
 //
-// Reference: https://zmk.dev/docs/development/studio-rpc-protocol
-// Proto schema source: https://github.com/zmkfirmware/zmk-studio-messages
-//
-// IMPORTANT — SETUP STEP REQUIRED:
-// This module uses protobufjs to encode/decode messages against ZMK's
-// actual .proto schema. You must copy the .proto files from the
-// zmk-studio-messages repo into ./assets/proto/ before this will work:
-//   assets/proto/studio.proto
+// Corrected against the ACTUAL proto schema in this project:
+//   assets/proto/studio.proto   — Request/Response/Notification envelope
 //   assets/proto/meta.proto
 //   assets/proto/core.proto
 //   assets/proto/behaviors.proto
-//   assets/proto/keymap.proto
-// (Download once from https://github.com/zmkfirmware/zmk-studio-messages —
-//  they rarely change, so this is a one-time copy, not a per-build step.)
+//   assets/proto/keymap.proto   — Keymap, Layer, BehaviorBinding, PhysicalLayout
+//
+// Reference: https://zmk.dev/docs/development/studio-rpc-protocol
 
 
 const StudioRpc = (() => {
@@ -31,13 +25,13 @@ const StudioRpc = (() => {
   let _RequestMsg  = null;
   let _ResponseMsg = null;
 
-  let _rxBuffer       = [];  // bytes accumulated for the current in-progress frame
-  let _inFrame         = false;
-  let _escapeNext       = false;
+  let _rxBuffer         = [];  // bytes accumulated for the current in-progress frame
+  let _inFrame           = false;
+  let _escapeNext        = false;
 
-  let _nextRequestId   = 1;
-  let _pendingRequests = new Map(); // request_id -> { resolve, reject, timeout }
-  let _notificationHandlers = [];   // callbacks for unsolicited device notifications
+  let _nextRequestId    = 1;
+  let _pendingRequests  = new Map(); // request_id -> { resolve, reject, timeout }
+  let _notificationHandlers = [];    // callbacks for unsolicited device notifications
 
   const REQUEST_TIMEOUT_MS = 8000;
 
@@ -61,8 +55,7 @@ const StudioRpc = (() => {
     } catch (e) {
       throw new Error(
         'Could not load ZMK Studio .proto schema from ./assets/proto/studio.proto. ' +
-        'Copy the .proto files from https://github.com/zmkfirmware/zmk-studio-messages ' +
-        'into assets/proto/ first. Original error: ' + e.message
+        'Original error: ' + e.message
       );
     }
 
@@ -96,6 +89,7 @@ const StudioRpc = (() => {
 
   // subsystem: 'core' | 'behaviors' | 'keymap'
   // payload: plain object matching that subsystem's Request message shape
+  // (must match the `oneof request_type` field name exactly, e.g. { get_keymap: true })
   function sendRequest(subsystem, payload) {
     if (!_protoRoot) throw new Error('StudioRpc not initialized — call connect() first.');
 
@@ -109,9 +103,9 @@ const StudioRpc = (() => {
     const errMsg = _RequestMsg.verify(requestObj);
     if (errMsg) throw new Error('Invalid RPC request shape: ' + errMsg);
 
-    const message   = _RequestMsg.create(requestObj);
-    const encoded   = _RequestMsg.encode(message).finish(); // Uint8Array
-    const framed    = _frame(encoded);
+    const message = _RequestMsg.create(requestObj);
+    const encoded = _RequestMsg.encode(message).finish(); // Uint8Array
+    const framed  = _frame(encoded);
 
     const promise = new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -213,13 +207,14 @@ const StudioRpc = (() => {
       return;
     }
 
+    // Response.type is `oneof { request_response, notification }`
     if (decoded.request_response) {
       const rr = decoded.request_response;
       const pending = _pendingRequests.get(rr.request_id);
       if (pending) {
         clearTimeout(pending.timeout);
         _pendingRequests.delete(rr.request_id);
-        pending.resolve(rr);
+        pending.resolve(rr); // rr.keymap / rr.core / rr.behaviors / rr.meta
       } else {
         console.warn('[StudioRpc] Response for unknown request_id', rr.request_id);
       }
@@ -247,39 +242,103 @@ const StudioRpc = (() => {
 
 
   // ════════════════════════════════════════
-  //  HIGH-LEVEL CONVENIENCE METHODS (built on sendRequest)
+  //  HIGH-LEVEL CONVENIENCE METHODS
+  //  — corrected against the real keymap.proto Request/Response oneofs
   // ════════════════════════════════════════
 
-  // Read the device's physical layout (key positions/shape)
-  function getPhysicalLayout() {
-    return sendRequest('core', { get_layouts: {} });
+  // zmk.keymap.Request.get_keymap is `bool` → send `true`
+  // Response: rr.keymap.get_keymap → Keymap { layers[], available_layers, max_layer_name_length }
+  async function getKeymap() {
+    const rr = await sendRequest('keymap', { get_keymap: true });
+    return rr.keymap.get_keymap;
   }
 
-  // Read the current keymap (all layers + bindings)
-  function getKeymap() {
-    return sendRequest('keymap', { get_keymap: {} });
+  // zmk.keymap.Request.get_physical_layouts is `bool` → send `true`
+  // Response: rr.keymap.get_physical_layouts → PhysicalLayouts { active_layout_index, layouts[] }
+  async function getPhysicalLayouts() {
+    const rr = await sendRequest('keymap', { get_physical_layouts: true });
+    return rr.keymap.get_physical_layouts;
   }
 
-  // Read the list of available behaviors (kp, mo, lt, etc.) the firmware supports
-  function getBehaviors() {
-    return sendRequest('behaviors', { list_all_behaviors: {} });
-  }
-
-  // Write a single key binding: layerId + keyPosition + behavior binding
-  function setKeyBinding(layerId, keyPositionIndex, bindingObj) {
-    return sendRequest('keymap', {
+  // Write a single key binding.
+  // binding must match BehaviorBinding { behavior_id (sint32), param1, param2 }
+  // behavior_id is a NUMERIC id from getBehaviors() — not a string like "LCZ".
+  // Response: rr.keymap.set_layer_binding → SetLayerBindingResponse enum
+  async function setKeyBinding(layerId, keyPosition, behaviorBinding) {
+    const rr = await sendRequest('keymap', {
       set_layer_binding: {
         layer_id: layerId,
-        key_position: keyPositionIndex,
-        binding: bindingObj,
+        key_position: keyPosition,
+        binding: behaviorBinding, // { behavior_id, param1, param2 }
       },
     });
+    return rr.keymap.set_layer_binding; // enum: 0 = OK
   }
 
-  // Save all pending changes to the device's flash settings partition
-  function saveChanges() {
-    return sendRequest('core', { save_changes: {} });
+  // zmk.keymap.Request.save_changes is `bool` → send `true`
+  // Response: rr.keymap.save_changes → SaveChangesResponse { ok } or { err: SaveChangesErrorCode }
+  async function saveChanges() {
+    const rr = await sendRequest('keymap', { save_changes: true });
+    return rr.keymap.save_changes;
   }
+
+  // zmk.keymap.Request.discard_changes is `bool` → send `true`
+  async function discardChanges() {
+    const rr = await sendRequest('keymap', { discard_changes: true });
+    return rr.keymap.discard_changes;
+  }
+
+  // zmk.keymap.Request.check_unsaved_changes is `bool` → send `true`
+  async function checkUnsavedChanges() {
+    const rr = await sendRequest('keymap', { check_unsaved_changes: true });
+    return rr.keymap.check_unsaved_changes;
+  }
+
+  // AddLayerRequest is an empty message → send `{}`
+  // Response: rr.keymap.add_layer → AddLayerResponse { ok: { index, layer } } or { err }
+  async function addLayer() {
+    const rr = await sendRequest('keymap', { add_layer: {} });
+    return rr.keymap.add_layer;
+  }
+
+  // RemoveLayerRequest { layer_index }
+  async function removeLayer(layerIndex) {
+    const rr = await sendRequest('keymap', { remove_layer: { layer_index: layerIndex } });
+    return rr.keymap.remove_layer;
+  }
+
+  // RestoreLayerRequest { layer_id, at_index }
+  async function restoreLayer(layerId, atIndex) {
+    const rr = await sendRequest('keymap', { restore_layer: { layer_id: layerId, at_index: atIndex } });
+    return rr.keymap.restore_layer;
+  }
+
+  // MoveLayerRequest { start_index, dest_index }
+  async function moveLayer(startIndex, destIndex) {
+    const rr = await sendRequest('keymap', {
+      move_layer: { start_index: startIndex, dest_index: destIndex },
+    });
+    return rr.keymap.move_layer;
+  }
+
+  // SetLayerPropsRequest { layer_id, name }
+  async function setLayerProps(layerId, name) {
+    const rr = await sendRequest('keymap', {
+      set_layer_props: { layer_id: layerId, name },
+    });
+    return rr.keymap.set_layer_props;
+  }
+
+  // zmk.keymap.Request.set_active_physical_layout is `uint32` (layout index)
+  async function setActivePhysicalLayout(layoutIndex) {
+    const rr = await sendRequest('keymap', { set_active_physical_layout: layoutIndex });
+    return rr.keymap.set_active_physical_layout; // { ok: Keymap } or { err }
+  }
+
+  // NOTE: behaviors.proto wasn't pasted yet — once you share it, I'll add
+  // getBehaviors() / getBehaviorDetails() here with the exact request/response
+  // field names (needed to build the friendly-name → behavior_id lookup table
+  // for the keycode picker UI in editMacros.js).
 
 
   return {
@@ -288,11 +347,18 @@ const StudioRpc = (() => {
     disconnect,
     sendRequest,
     onNotification,
-    getPhysicalLayout,
     getKeymap,
-    getBehaviors,
+    getPhysicalLayouts,
     setKeyBinding,
     saveChanges,
+    discardChanges,
+    checkUnsavedChanges,
+    addLayer,
+    removeLayer,
+    restoreLayer,
+    moveLayer,
+    setLayerProps,
+    setActivePhysicalLayout,
   };
 
 })();
