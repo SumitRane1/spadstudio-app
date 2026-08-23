@@ -8,15 +8,20 @@
 //   they never collide on the WritableStream lock.
 // Fix 3 (sequential RPC pacing): loadAllBehaviors() sends requests one at a
 //   time instead of Promise.all(), respecting the firmware's small RPC buffers.
-// Fix 4 (THIS FILE — idempotent connect): Flash.init() silently reconnects
-//   WebSerial's raw port on page load via WebSerial.reconnectSilently(). That
-//   made WebSerial.isConnected() return true immediately, so flash.js's
-//   `if (!WebSerial.isConnected()) await StudioRpc.connect()` guard skipped
-//   calling StudioRpc.connect() entirely — meaning the .proto schema was
-//   NEVER loaded and the read loop was NEVER wired up, even though the UI
-//   showed "Device connected". connect() is now idempotent: it always
-//   ensures init() (proto load) has run and the read loop is listening,
-//   while only opening the WebSerial picker if a port isn't already open.
+// Fix 4 (idempotent connect): connect() always ensures init() (proto load)
+//   has run and the read loop is listening, while only opening the
+//   WebSerial picker if a port isn't already open.
+// Fix 5 (THIS FILE — dead read loop after hardware disconnect): _isListening
+//   was only ever reset to false inside StudioRpc.disconnect() (the MANUAL
+//   disconnect path). When the device was physically unplugged, WebSerial's
+//   own hardware-disconnect handler tore down the port/reader, but nothing
+//   told studioRpc.js. _isListening stayed true from the dead connection, so
+//   the next connect() skipped re-arming WebSerial.startReading() on the
+//   NEW port — writes succeeded, but responses were never read, so every
+//   request after a reconnect timed out. Fixed by registering
+//   WebSerial.onDisconnect() to reset _isListening (and reject pending
+//   requests) the moment a hardware disconnect happens, so the next
+//   connect() correctly re-arms the read loop on the new port.
 
 
 const StudioRpc = (() => {
@@ -39,6 +44,7 @@ const StudioRpc = (() => {
 
   let _behaviorCache = new Map();
   let _isListening   = false; // guards against double read-loop registration
+  let _disconnectHandlerRegistered = false; // guards against double onDisconnect registration
 
   const REQUEST_TIMEOUT_MS = 8000;
 
@@ -81,6 +87,14 @@ const StudioRpc = (() => {
   // ════════════════════════════════════════
 
   async function connect() {
+    // 0. Register our hardware-disconnect listener exactly once, so that any
+    //    future physical unplug correctly resets our internal read-loop
+    //    state — regardless of how many times connect()/disconnect() run.
+    if (!_disconnectHandlerRegistered) {
+      WebSerial.onDisconnect(_onHardwareDisconnect);
+      _disconnectHandlerRegistered = true;
+    }
+
     // 1. Always ensure the proto schema is loaded (no-ops if already done).
     await init();
 
@@ -91,9 +105,10 @@ const StudioRpc = (() => {
       await WebSerial.connect();
     }
 
-    // 3. Only start the read loop once per connection. Calling
-    //    startReading() twice would grab a second reader on an
-    //    already-locked ReadableStream and throw.
+    // 3. Only start the read loop once per LIVE connection. _isListening is
+    //    reset to false by _onHardwareDisconnect() whenever the device is
+    //    physically unplugged, so this correctly re-arms on the new port
+    //    after any reconnect instead of assuming the old dead loop is fine.
     if (!_isListening) {
       WebSerial.startReading(_onSerialBytes);
       _isListening = true;
@@ -107,6 +122,19 @@ const StudioRpc = (() => {
     await WebSerial.disconnect();
     _behaviorCache.clear();
     _isListening = false;
+  }
+
+  // ★ FIX: fires when WebSerial detects a PHYSICAL unplug (not a manual
+  // disconnect() call). Resets the read-loop flag so the next connect()
+  // re-arms WebSerial.startReading() on the freshly reconnected port,
+  // instead of silently skipping it and leaving every future request to
+  // time out with no one reading the responses.
+  function _onHardwareDisconnect() {
+    console.warn('[StudioRpc] Hardware disconnect detected — resetting RPC state for next reconnect');
+    _isListening = false;
+    _rejectAllPending(new Error('Device disconnected'));
+    // Deliberately NOT clearing _protoRoot/_RequestMsg/_ResponseMsg — the
+    // proto schema doesn't need reloading, only the transport-level state.
   }
 
 
