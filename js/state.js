@@ -1,4 +1,16 @@
 // ═══ STATE — Single source of truth ═══
+//
+// ═══ FIX (2026-08-24) — 4-layer cap ═══
+// addLayer() had no upper limit, which let users manually create 6 layers
+// in state.layers, thinking they needed one entry per real firmware layer.
+// That's wrong: KeymapGenerator.js auto-generates the 2 encoder-mode overlay
+// layers (Volume/Brightness) from state.encoder — they must NEVER be created
+// as regular state.layers entries. Doing so shifted contentLayerCount and
+// broke every FN/encoder-push binding index (symptom: encoder push firing
+// an unrelated key like Ctrl+Z). addLayer() now hard-caps at
+// KeymapGenerator.MAX_CONTENT_LAYERS (4) and returns an error the UI can
+// show instead of silently corrupting layer indices.
+
 
 const State = (() => {
 
@@ -9,6 +21,8 @@ const State = (() => {
 
     // ── Encoder rotation is INDEPENDENT from layers ──
     // Push button cycles: scroll → volume → brightness → scroll
+    // These 2 non-scroll modes become AUTO-GENERATED overlay layers in
+    // KeymapGenerator.js — never add them manually via addLayer().
     encoder: {
       scroll:     { cw: 'PG_DN',     ccw: 'PG_UP'    },
       volume:     { cw: 'C_VOL_UP',  ccw: 'C_VOL_DN' },
@@ -92,8 +106,21 @@ const State = (() => {
     set({ layers });
   }
 
-  // ── Add a new blank layer ──
+  // ★ FIX: hard cap at KeymapGenerator.MAX_CONTENT_LAYERS (4). The 2
+  // encoder-mode overlay layers (Volume/Brightness) are NOT regular content
+  // layers — they're auto-generated from state.encoder. Adding them here
+  // corrupts contentLayerCount and shifts every FN/encoder-push index.
+  // Returns { ok, error } so the UI can show why the button is disabled/blocked.
   function addLayer(name) {
+    const maxLayers = (typeof KeymapGenerator !== 'undefined' && KeymapGenerator.MAX_CONTENT_LAYERS) || 4;
+
+    if (_state.layers.length >= maxLayers) {
+      return {
+        ok: false,
+        error: `Max ${maxLayers} content layers reached. Volume/Brightness encoder modes are separate — configure them in the Encoder panel, not as layers.`,
+      };
+    }
+
     const layers = JSON.parse(JSON.stringify(_state.layers));
     layers.push({
       id: 'layer_' + Date.now(),
@@ -103,6 +130,7 @@ const State = (() => {
       encoderPush: 'TRANS',
     });
     set({ layers, buildMode: 'custom' });
+    return { ok: true };
   }
 
   // ── Delete a layer by index ──
