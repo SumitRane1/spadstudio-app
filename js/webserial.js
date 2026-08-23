@@ -2,17 +2,24 @@
 // Handles opening/closing a serial connection to the nice!nano
 // running Studio-enabled firmware (CONFIG_ZMK_STUDIO=y + studio-rpc-usb-uart).
 //
-// This module ONLY handles the raw serial transport (connect, read, write,
-// disconnect). The protobuf RPC framing/parsing lives in studioRpc.js.
+// This module ONLY handles raw serial transport (connect/read/write/disconnect).
+// Protobuf RPC framing/parsing lives in studioRpc.js.
+//
+// IMPORTANT FOR FIRST TESTING:
+// requestPort() intentionally has NO vendor/product filter. ZMK Studio's
+// USB-CDC serial interface can use a VID/PID different from the board's
+// bootloader VID/PID. A filter caused Chrome to display "No compatible
+// devices found" even if the device was present. Once a real device is
+// confirmed in the chooser, add its exact VID/PID later if desired.
 
 
 const WebSerial = (() => {
 
-  let _port              = null;
-  let _reader             = null;
-  let _writer             = null;
-  let _readLoopAbort      = false;
-  let _onDataCallback     = null;
+  let _port                 = null;
+  let _reader               = null;
+  let _writer               = null;
+  let _readLoopAbort        = false;
+  let _onDataCallback       = null;
   let _onDisconnectCallback = null;
 
   // ════════════════════════════════════════
@@ -29,30 +36,25 @@ const WebSerial = (() => {
 
   async function connect(options = {}) {
     if (!isSupported()) {
-      throw new Error('WebSerial not supported. Use Chrome or Edge.');
+      throw new Error('WebSerial is not supported. Use Chrome or Edge.');
     }
 
     if (_port) {
       throw new Error('Already connected. Disconnect first.');
     }
 
-    // Show browser's serial port picker.
-    // Filter to known nice!nano / nRF52840 USB-serial VID/PIDs where possible,
-    // but the picker still lets the user choose any device as fallback.
-    const filters = [
-      { usbVendorId: 0x239A }, // Adafruit (nice!nano)
-      { usbVendorId: 0x1915 }, // Nordic Semiconductor
-      { usbVendorId: 0x2341 }, // Arduino-compatible clones
-    ];
-
     try {
-      _port = await navigator.serial.requestPort({ filters });
+      // Do NOT pass filters during initial testing.
+      // This displays every serial device that Windows/Chrome can see.
+      _port = await navigator.serial.requestPort();
     } catch (e) {
       if (e.name === 'NotFoundError') throw new Error('No device selected.');
-      throw new Error('Could not open device picker: ' + e.message);
+      throw new Error('Could not open the serial device picker: ' + e.message);
     }
 
-    // Studio's RPC transport runs over USB-CDC ACM at 115200 baud by default.
+    // The studio-rpc-usb-uart snippet uses USB CDC ACM. For CDC devices the
+    // baud rate is generally ignored by USB itself, but Web Serial still
+    // requires one when opening the port; 115200 is ZMK Studio's convention.
     const baudRate = options.baudRate || 115200;
 
     try {
@@ -62,10 +64,10 @@ const WebSerial = (() => {
       throw new Error('Failed to open serial port: ' + e.message);
     }
 
-    // Listen for physical disconnect (unplug)
     navigator.serial.addEventListener('disconnect', _handleHardwareDisconnect);
 
-    console.log('[WebSerial] Connected @', baudRate, 'baud');
+    const info = _port.getInfo ? _port.getInfo() : {};
+    console.log('[WebSerial] Connected @', baudRate, 'baud', info);
     return true;
   }
 
@@ -77,12 +79,15 @@ const WebSerial = (() => {
     if (!_port || !_port.readable) {
       throw new Error('Port not open. Call connect() first.');
     }
+
     _onDataCallback = onData;
     _readLoopAbort = false;
-    _readLoop(); // fire and forget
+    _readLoop(); // fire-and-forget async loop
   }
 
   async function _readLoop() {
+    if (!_port?.readable) return;
+
     _reader = _port.readable.getReader();
     try {
       while (!_readLoopAbort) {
@@ -93,27 +98,32 @@ const WebSerial = (() => {
         }
       }
     } catch (e) {
-      console.warn('[WebSerial] Read loop ended:', e.message);
+      // cancel()/unplug commonly ends read() with an error; only log it.
+      if (!_readLoopAbort) {
+        console.warn('[WebSerial] Read loop ended:', e.message);
+      }
     } finally {
-      try { _reader.releaseLock(); } catch (e) {}
+      try { _reader?.releaseLock(); } catch (e) {}
       _reader = null;
     }
   }
 
   // ════════════════════════════════════════
-  //  WRITE — send raw bytes (protobuf-framed messages from studioRpc.js)
+  //  WRITE — send raw bytes (protobuf frames from studioRpc.js)
   // ════════════════════════════════════════
 
   async function write(bytes) {
     if (!_port || !_port.writable) {
       throw new Error('Port not open. Call connect() first.');
     }
-    _writer = _port.writable.getWriter();
+
+    // A writer lock is temporary for each write. This avoids holding it while
+    // the read loop is running on its separate readable stream.
+    const writer = _port.writable.getWriter();
     try {
-      await _writer.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+      await writer.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
     } finally {
-      _writer.releaseLock();
-      _writer = null;
+      writer.releaseLock();
     }
   }
 
@@ -124,19 +134,19 @@ const WebSerial = (() => {
   async function disconnect() {
     _readLoopAbort = true;
 
-    try { if (_reader) await _reader.cancel(); } catch (e) {}
-    try { if (_writer) await _writer.close(); } catch (e) {}
+    try { await _reader?.cancel(); } catch (e) {}
+    try { _reader?.releaseLock(); } catch (e) {}
+    _reader = null;
 
-    if (_port) {
-      try { await _port.close(); } catch (e) {}
-    }
+    const portToClose = _port;
+    _port = null;
+    _onDataCallback = null;
 
     navigator.serial.removeEventListener('disconnect', _handleHardwareDisconnect);
 
-    _port   = null;
-    _reader = null;
-    _writer = null;
-    _onDataCallback = null;
+    if (portToClose) {
+      try { await portToClose.close(); } catch (e) {}
+    }
 
     console.log('[WebSerial] Disconnected');
   }
@@ -149,9 +159,12 @@ const WebSerial = (() => {
     if (event.target === _port) {
       console.warn('[WebSerial] Device physically unplugged');
       _readLoopAbort = true;
-      _port   = null;
+      _port = null;
       _reader = null;
       _writer = null;
+      _onDataCallback = null;
+
+      navigator.serial.removeEventListener('disconnect', _handleHardwareDisconnect);
       if (_onDisconnectCallback) _onDisconnectCallback();
     }
   }
@@ -168,22 +181,29 @@ const WebSerial = (() => {
     return _port !== null;
   }
 
+  function getDeviceInfo() {
+    return _port?.getInfo ? _port.getInfo() : null;
+  }
+
   // ════════════════════════════════════════
-  //  RECONNECT TO PREVIOUSLY GRANTED PORT (no picker popup)
+  //  RECONNECT TO A PREVIOUSLY GRANTED PORT (no picker popup)
   // ════════════════════════════════════════
 
   async function reconnectSilently(baudRate = 115200) {
-    if (!isSupported()) return false;
+    if (!isSupported() || _port) return false;
 
     const ports = await navigator.serial.getPorts();
     if (ports.length === 0) return false;
 
-    // Use the first previously-granted port (usually only one macropad)
-    _port = ports[0];
+    // Usually only one device was granted. If multiple exist, the next normal
+    // Send to Device click lets the user choose explicitly in the picker.
+    const candidate = ports[0];
+
     try {
-      await _port.open({ baudRate });
+      await candidate.open({ baudRate });
+      _port = candidate;
       navigator.serial.addEventListener('disconnect', _handleHardwareDisconnect);
-      console.log('[WebSerial] Silently reconnected to previously granted port');
+      console.log('[WebSerial] Silently reconnected to previously granted port', getDeviceInfo());
       return true;
     } catch (e) {
       _port = null;
@@ -198,6 +218,7 @@ const WebSerial = (() => {
     write,
     disconnect,
     isConnected,
+    getDeviceInfo,
     onDisconnect,
     reconnectSilently,
   };
