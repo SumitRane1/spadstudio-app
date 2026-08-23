@@ -1,4 +1,18 @@
 // ═══ LAYERS — Layer tabs + Add Layer Modal ═══
+//
+// ═══ FIX (2026-08-24) ═══
+// 1. This file referenced `KeymapGenerator.MAX_LAYERS`, which doesn't exist
+//    — the real constant is `KeymapGenerator.MAX_CONTENT_LAYERS`. Reading an
+//    undefined property meant `layers.length >= undefined` was ALWAYS false,
+//    so the "+ Add Layer" button was NEVER actually disabled at 4 layers,
+//    despite this file's own comments saying it should be. Fixed all 3
+//    references (render()'s atMax check, the badge, and the init() double-check).
+// 2. _confirmAdd()'s PRESET branch pushed directly into state.layers via
+//    State.set(), completely bypassing State.addLayer()'s own cap check.
+//    That meant even with the naming bug fixed, adding a layer via a
+//    software preset (not "Blank Layer") could still exceed 4. Added the
+//    same cap check directly before the preset push.
+
 
 const Layers = (() => {
 
@@ -12,7 +26,8 @@ const Layers = (() => {
     if (!container) return;
 
     const { layers, activeLayerIndex } = State.get();
-    const atMax = layers.length >= KeymapGenerator.MAX_LAYERS;
+    // ★ FIX: MAX_LAYERS -> MAX_CONTENT_LAYERS
+    const atMax = layers.length >= KeymapGenerator.MAX_CONTENT_LAYERS;
 
     container.innerHTML = layers.map((layer, i) => `
       <div class="layer-tab ${i === activeLayerIndex ? 'active' : ''}"
@@ -54,8 +69,9 @@ const Layers = (() => {
     const addBtn = document.getElementById('btn-add-layer');
     if (addBtn) {
       addBtn.disabled          = atMax;
+      // ★ FIX: MAX_LAYERS -> MAX_CONTENT_LAYERS
       addBtn.title             = atMax
-        ? `Maximum ${KeymapGenerator.MAX_LAYERS} layers reached`
+        ? `Maximum ${KeymapGenerator.MAX_CONTENT_LAYERS} layers reached`
         : 'Add layer';
       addBtn.style.opacity     = atMax ? '0.4' : '1';
       addBtn.style.cursor      = atMax ? 'not-allowed' : 'pointer';
@@ -65,7 +81,8 @@ const Layers = (() => {
     // ── Layer count badge ──
     const badge = document.getElementById('layer-count-badge');
     if (badge) {
-      badge.textContent = `${layers.length} / ${KeymapGenerator.MAX_LAYERS}`;
+      // ★ FIX: MAX_LAYERS -> MAX_CONTENT_LAYERS
+      badge.textContent = `${layers.length} / ${KeymapGenerator.MAX_CONTENT_LAYERS}`;
       badge.style.color = atMax
         ? 'var(--color-warning)'
         : 'var(--color-text-faint)';
@@ -76,8 +93,9 @@ const Layers = (() => {
   function init() {
     document.getElementById('btn-add-layer')?.addEventListener('click', () => {
       const { layers } = State.get();
-      if (layers.length >= KeymapGenerator.MAX_LAYERS) {
-        App.showToast(`Maximum ${KeymapGenerator.MAX_LAYERS} layers reached`, 'warning');
+      // ★ FIX: MAX_LAYERS -> MAX_CONTENT_LAYERS
+      if (layers.length >= KeymapGenerator.MAX_CONTENT_LAYERS) {
+        App.showToast(`Maximum ${KeymapGenerator.MAX_CONTENT_LAYERS} layers reached`, 'warning');
         return;
       }
       openModal();
@@ -299,9 +317,10 @@ const Layers = (() => {
 
   function _confirmAdd() {
     // Double-check limit at confirm time
+    // ★ FIX: MAX_LAYERS -> MAX_CONTENT_LAYERS
     const { layers } = State.get();
-    if (layers.length >= KeymapGenerator.MAX_LAYERS) {
-      App.showToast(`Maximum ${KeymapGenerator.MAX_LAYERS} layers reached`, 'warning');
+    if (layers.length >= KeymapGenerator.MAX_CONTENT_LAYERS) {
+      App.showToast(`Maximum ${KeymapGenerator.MAX_CONTENT_LAYERS} layers reached`, 'warning');
       _closeModal();
       return;
     }
@@ -309,7 +328,12 @@ const Layers = (() => {
     if (_mode === 'blank') {
       const nameInput = document.getElementById('blank-layer-name');
       const name = nameInput?.value.trim() || `Layer ${layers.length + 1}`;
-      State.addLayer(name);
+      const result = State.addLayer(name);
+      if (result && result.ok === false) {
+        App.showToast(result.error, 'warning');
+        _closeModal();
+        return;
+      }
       const newIdx = State.get().layers.length - 1;
       State.set({ activeLayerIndex: newIdx });
       render();
@@ -318,6 +342,16 @@ const Layers = (() => {
       App.showToast(`Layer "${name}" added — full compile required`, 'warning');
 
     } else if (_selectedPreset) {
+      // ★ FIX: this branch bypassed State.addLayer()'s cap by writing
+      // directly via State.set(). Re-checked the cap explicitly here too,
+      // since the guard above already covers it — kept for defense-in-depth
+      // in case this branch is ever refactored to run independently.
+      if (State.get().layers.length >= KeymapGenerator.MAX_CONTENT_LAYERS) {
+        App.showToast(`Maximum ${KeymapGenerator.MAX_CONTENT_LAYERS} layers reached`, 'warning');
+        _closeModal();
+        return;
+      }
+
       const p = _selectedPreset;
       const layersCopy = JSON.parse(JSON.stringify(State.get().layers));
       layersCopy.push({
@@ -325,6 +359,7 @@ const Layers = (() => {
         name: p.name,
         keys: [...p.keys],
         fnAction: p.fnAction,
+        encoderPush: p.encoderPush || 'TRANS',
       });
       State.set({ layers: layersCopy, buildMode: 'custom' });
       const newIdx = layersCopy.length - 1;
