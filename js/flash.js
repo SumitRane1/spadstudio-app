@@ -1,12 +1,21 @@
 // ═══ FLASH — Step 4: "Send to Device" (auto live-push or compile fallback) ═══
 //
-// ═══ FIX (2026-08-24) ═══
-// _decideAction() now logs the EXACT layer name, key index, and ZMK code
-// that triggered a fallback, instead of a generic reason string. This is
-// what caught the earlier bug: &kp C_SLEEP in the System layer wasn't in
-// zmkStringTranslator's consumer table, silently forcing a full rebuild
-// every time. Console now shows exactly which key/code to fix instead of
-// requiring manual guessing.
+// ═══ FIX HISTORY ═══
+// Fix (2026-08-24, translator gaps): added C_SLEEP etc. to keycodeTranslator.js
+//   / zmkStringTranslator.js, and console.table() logging of exactly which
+//   layer/key/code triggers a fallback.
+//
+// Fix (2026-08-24, THIS FILE — capacity check was comparing the wrong thing):
+//   liveKeymap.available_layers is the REMAINING layer capacity (how many
+//   MORE layers can still be added), not the total number of layer slots.
+//   The old check `state.layers.length > liveKeymap.available_layers`
+//   compared your desired layer count directly against leftover capacity,
+//   which is wrong — a device that already has 4 pre-allocated layers in
+//   use correctly reports available_layers = 0, and ANY keymap using all 4
+//   existing layers would fail that check even though nothing new is being
+//   added. Fixed to compare against TOTAL capacity (existing + available).
+//   This was the actual cause of every "Send to Device" click going to the
+//   3-5 min GitHub Actions rebuild, regardless of what was edited.
 
 
 const Flash = (() => {
@@ -227,12 +236,23 @@ const Flash = (() => {
     }
   }
 
-  // ★ FIX: now logs the exact layer/key/code that caused a fallback to
-  // console.table, so future translator gaps are instantly diagnosable
-  // instead of requiring manual screenshot-by-screenshot debugging.
+  // ★ FIX (2026-08-24): compare against TOTAL layer capacity
+  // (liveKeymap.layers.length + liveKeymap.available_layers), not just
+  // available_layers alone. available_layers is REMAINING capacity to add
+  // new layers — it is legitimately 0 once all pre-allocated slots are in
+  // use, which is the normal, expected state for a fully set-up device.
+  // Comparing state.layers.length directly against that remaining-capacity
+  // number was always failing for any keymap using all existing layers,
+  // forcing an unnecessary full rebuild on every single edit.
   function _decideAction(state, liveKeymap) {
-    if (state.layers.length > liveKeymap.available_layers) {
-      console.warn('[Flash] FLASH_REQUIRED: layer count', state.layers.length, '>', liveKeymap.available_layers);
+    const totalCapacity = liveKeymap.layers.length + liveKeymap.available_layers;
+
+    if (state.layers.length > totalCapacity) {
+      console.warn(
+        '[Flash] FLASH_REQUIRED: layer count', state.layers.length,
+        '> total capacity', totalCapacity,
+        `(${liveKeymap.layers.length} existing + ${liveKeymap.available_layers} available)`
+      );
       return { action: 'FLASH_REQUIRED', reason: 'more layers than firmware supports' };
     }
 
