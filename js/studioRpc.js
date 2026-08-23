@@ -1,60 +1,50 @@
 // ═══ STUDIO RPC — ZMK Studio protobuf RPC message layer ═══
-// Sits on top of WebSerial (webserial.js). Handles:
-//   1. Message FRAMING (SoF/Esc/EoF byte escaping) — verified against the
-//      official spec: https://zmk.dev/docs/development/studio-rpc-protocol
-//   2. Protobuf ENCODE/DECODE of Request/Response messages
-//   3. A request/response promise-matching layer keyed by request_id
-//   4. Behavior discovery + caching (behaviors.proto)
+// Sits on top of WebSerial (webserial.js).
 //
-// ═══ ROOT CAUSE FIX (2026-08-24) ═══
-// Root cause of the "RPC request timed out" bug: protobufjs converts .proto
-// field names to camelCase by default (request_id -> requestId,
-// list_all_behaviors -> listAllBehaviors). Our code builds request objects
-// using the ORIGINAL snake_case names from the .proto files, so
-// Message.create() was silently dropping every field it didn't recognize —
-// we were sending nearly-empty messages the firmware correctly ignored.
-// Fix: load the proto root with { keepCase: true } so field names stay
-// exactly as declared in the .proto files, matching this file's code.
-//
-// Corrected against the ACTUAL proto schema in this project:
-//   assets/proto/studio.proto     — Request/Response/Notification envelope
-//   assets/proto/meta.proto
-//   assets/proto/core.proto
-//   assets/proto/behaviors.proto  — ListAllBehaviors, GetBehaviorDetails
-//   assets/proto/keymap.proto     — Keymap, Layer, BehaviorBinding, PhysicalLayout
+// ═══ FIX HISTORY ═══
+// Fix 1 (keepCase): protobufjs camelCases .proto field names by default —
+//   loading with { keepCase: true } preserves snake_case, matching this file.
+// Fix 2 (serialized writes): webserial.js now queues all write() calls so
+//   they never collide on the WritableStream lock.
+// Fix 3 (THIS FILE, sequential RPC pacing): loadAllBehaviors() previously
+//   fired all getBehaviorDetails() calls via Promise.all — sending requests
+//   as fast as JS could loop, with no regard for whether the firmware had
+//   replied yet. ZMK Studio's RPC buffers are tiny by default
+//   (CONFIG_ZMK_STUDIO_RPC_RX_BUF_SIZE / TX_BUF_SIZE, ~30-64 bytes), so the
+//   firmware can only track a few in-flight requests before dropping later
+//   ones — this is why request #5 (and beyond) timed out. Fix: await each
+//   request fully before sending the next one.
 
 
 const StudioRpc = (() => {
 
-  // ── Framing bytes (verified against official ZMK Studio RPC protocol spec) ──
-  const SOF = 0xAB; // Start of Frame
-  const ESC = 0xAC; // Escape byte
-  const EOF = 0xAD; // End of Frame
+  const SOF = 0xAB;
+  const ESC = 0xAC;
+  const EOF = 0xAD;
 
-  let _protoRoot   = null;   // protobufjs Root, loaded once
+  let _protoRoot   = null;
   let _RequestMsg  = null;
   let _ResponseMsg = null;
 
-  let _rxBuffer         = [];  // bytes accumulated for the current in-progress frame
-  let _inFrame           = false;
-  let _escapeNext        = false;
+  let _rxBuffer   = [];
+  let _inFrame    = false;
+  let _escapeNext = false;
 
-  let _nextRequestId    = 1;
-  let _pendingRequests  = new Map(); // request_id -> { resolve, reject, timeout }
-  let _notificationHandlers = [];    // callbacks for unsolicited device notifications
+  let _nextRequestId   = 1;
+  let _pendingRequests = new Map();
+  let _notificationHandlers = [];
 
-  // behavior_id -> { id, display_name, metadata } — populated by getBehaviors()
   let _behaviorCache = new Map();
 
   const REQUEST_TIMEOUT_MS = 8000;
 
 
   // ════════════════════════════════════════
-  //  INIT — load .proto schema via protobufjs (CDN)
+  //  INIT
   // ════════════════════════════════════════
 
   async function init() {
-    if (_protoRoot) return; // already loaded
+    if (_protoRoot) return;
 
     if (typeof protobuf === 'undefined') {
       throw new Error(
@@ -64,9 +54,6 @@ const StudioRpc = (() => {
     }
 
     try {
-      // ★ THE FIX ★ — { keepCase: true } preserves snake_case field names
-      // (request_id, list_all_behaviors, etc.) instead of protobufjs
-      // silently camelCasing them and dropping our fields on .create().
       const root = new protobuf.Root();
       _protoRoot = await root.load('./assets/proto/studio.proto', { keepCase: true });
     } catch (e) {
@@ -84,7 +71,7 @@ const StudioRpc = (() => {
 
 
   // ════════════════════════════════════════
-  //  CONNECT — wires WebSerial's byte stream into the frame decoder
+  //  CONNECT
   // ════════════════════════════════════════
 
   async function connect() {
@@ -106,9 +93,6 @@ const StudioRpc = (() => {
   //  OUTGOING — build + frame + send a Request, return a Promise of Response
   // ════════════════════════════════════════
 
-  // subsystem: 'core' | 'behaviors' | 'keymap'
-  // payload: plain object matching that subsystem's Request message shape
-  // (must match the `oneof request_type` field name exactly, e.g. { get_keymap: true })
   function sendRequest(subsystem, payload) {
     if (!_protoRoot) throw new Error('StudioRpc not initialized — call connect() first.');
 
@@ -123,9 +107,9 @@ const StudioRpc = (() => {
     if (errMsg) throw new Error('Invalid RPC request shape: ' + errMsg);
 
     const message = _RequestMsg.create(requestObj);
-    const encoded = _RequestMsg.encode(message).finish(); // Uint8Array
+    const encoded = _RequestMsg.encode(message).finish();
 
-    console.log('[StudioRpc] Sending', subsystem, payload, '→', encoded.length, 'bytes encoded');
+    console.log('[StudioRpc] Sending', subsystem, payload, '→', encoded.length, 'bytes encoded (id', requestId + ')');
 
     const framed = _frame(encoded);
 
@@ -150,18 +134,23 @@ const StudioRpc = (() => {
     return promise;
   }
 
+  // Sends a request and waits for its own response before returning —
+  // use this inside loops/batches instead of Promise.all(), so the
+  // firmware's small RPC buffers never get flooded with concurrent requests.
+  async function sendRequestSequential(subsystem, payload) {
+    return sendRequest(subsystem, payload);
+  }
+
 
   // ════════════════════════════════════════
-  //  FRAMING — escape payload and wrap with SoF/EoF
+  //  FRAMING
   // ════════════════════════════════════════
 
   function _frame(payloadBytes) {
     const out = [SOF];
     for (let i = 0; i < payloadBytes.length; i++) {
       const b = payloadBytes[i];
-      if (b === SOF || b === ESC || b === EOF) {
-        out.push(ESC);
-      }
+      if (b === SOF || b === ESC || b === EOF) out.push(ESC);
       out.push(b);
     }
     out.push(EOF);
@@ -170,7 +159,7 @@ const StudioRpc = (() => {
 
 
   // ════════════════════════════════════════
-  //  DEFRAMING — incoming byte stream state machine
+  //  DEFRAMING
   // ════════════════════════════════════════
 
   function _onSerialBytes(chunk) {
@@ -183,7 +172,7 @@ const StudioRpc = (() => {
           _rxBuffer = [];
           _escapeNext = false;
         }
-        continue; // ignore stray bytes outside a frame
+        continue;
       }
 
       if (_escapeNext) {
@@ -205,7 +194,6 @@ const StudioRpc = (() => {
       }
 
       if (b === SOF) {
-        // Unescaped SoF mid-frame means we lost sync — restart defensively.
         _rxBuffer = [];
         continue;
       }
@@ -216,7 +204,7 @@ const StudioRpc = (() => {
 
 
   // ════════════════════════════════════════
-  //  HANDLE DECODED FRAME — decode protobuf, route to pending promise or notification
+  //  HANDLE DECODED FRAME
   // ════════════════════════════════════════
 
   function _handleCompleteFrame(bytes) {
@@ -227,8 +215,6 @@ const StudioRpc = (() => {
       console.warn('[StudioRpc] Failed to decode frame:', e.message, bytes);
       return;
     }
-
-    console.log('[StudioRpc] Received frame:', decoded);
 
     if (decoded.request_response) {
       const rr = decoded.request_response;
@@ -264,7 +250,7 @@ const StudioRpc = (() => {
 
 
   // ════════════════════════════════════════
-  //  KEYMAP METHODS — matched against real keymap.proto
+  //  KEYMAP METHODS
   // ════════════════════════════════════════
 
   async function getKeymap() {
@@ -339,7 +325,7 @@ const StudioRpc = (() => {
 
 
   // ════════════════════════════════════════
-  //  BEHAVIOR METHODS — matched against real behaviors.proto
+  //  BEHAVIOR METHODS
   // ════════════════════════════════════════
 
   async function listAllBehaviorIds() {
@@ -354,17 +340,19 @@ const StudioRpc = (() => {
     return rr.behaviors.get_behavior_details;
   }
 
-  async function loadAllBehaviors() {
+  // ★ FIX: sequential, not Promise.all(). Each getBehaviorDetails() call now
+  // fully completes (request sent, response received) before the next one
+  // is sent — this respects the firmware's small RPC buffer capacity and
+  // eliminates the request-N-times-out failures seen with parallel bursts.
+  async function loadAllBehaviors(onProgress) {
     const ids = await listAllBehaviorIds();
     _behaviorCache.clear();
 
-    const detailsList = await Promise.all(
-      ids.map(id => getBehaviorDetails(id))
-    );
-
-    detailsList.forEach(details => {
+    for (let i = 0; i < ids.length; i++) {
+      const details = await getBehaviorDetails(ids[i]);
       _behaviorCache.set(details.id, details);
-    });
+      if (onProgress) onProgress(i + 1, ids.length, details.display_name);
+    }
 
     console.log(`[StudioRpc] Loaded ${_behaviorCache.size} behaviors`);
     return _behaviorCache;
@@ -398,6 +386,7 @@ const StudioRpc = (() => {
     connect,
     disconnect,
     sendRequest,
+    sendRequestSequential,
     onNotification,
 
     getKeymap,
