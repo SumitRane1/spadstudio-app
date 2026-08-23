@@ -1,29 +1,18 @@
 // ═══ FLASH — Step 4: "Send to Device" (auto live-push or compile fallback) ═══
 //
-// Same 4-step flow as before (Profile → Editor → Review → Flash).
-// Step 4 auto-decides per the original decideAction logic:
-//   - Small edits (keys within existing layer/key capacity)  -> instant
-//     live push over ZMK Studio RPC. No compile, no reflash, NO bootloader
-//     mode — the device stays in its normal running state the whole time.
-//   - Structural changes (more layers than firmware pre-allocated, or a
-//     code that can't be represented live) -> falls back to the full
-//     GitHub Actions compile + WebUSB flash path (which DOES require
-//     double-tap reset into bootloader mode — that instruction lives only
-//     in the "First-time setup" section below, where it belongs).
-//
-// IMPORTANT DISTINCTION:
-//   Bootloader mode (double-tap reset) = for writing raw .uf2 firmware files.
-//   Studio RPC connection             = talks to firmware that's ALREADY
-//                                        running normally. No reset needed.
-//
-// Depends on (load order): githubFlash.js, webusb.js, webserial.js,
-// studioRpc.js, keycodeTranslator.js, zmkStringTranslator.js, then flash.js.
+// ═══ FIX (2026-08-24) ═══
+// _decideAction() now logs the EXACT layer name, key index, and ZMK code
+// that triggered a fallback, instead of a generic reason string. This is
+// what caught the earlier bug: &kp C_SLEEP in the System layer wasn't in
+// zmkStringTranslator's consumer table, silently forcing a full rebuild
+// every time. Console now shows exactly which key/code to fix instead of
+// requiring manual guessing.
 
 
 const Flash = (() => {
 
   let _isBusy       = false;
-  let _uf2Buffer     = null;   // compiled firmware, for the fallback compile path
+  let _uf2Buffer     = null;
   let _liveConnected = false;
 
 
@@ -42,7 +31,6 @@ const Flash = (() => {
     container.innerHTML = `
       <div class="flash-panel">
 
-        <!-- ── Status Banner ── -->
         <div class="flash-connect-banner ${_liveConnected ? 'connected' : ''}">
           <div class="connected-banner">
             <span class="connected-dot"></span>
@@ -64,7 +52,6 @@ const Flash = (() => {
         </div>
         ` : ''}
 
-        <!-- ── SEND TO DEVICE (primary action) ── -->
         <div class="flash-mode-card available">
           <div class="flash-mode-title">
             📤 Send to Device
@@ -100,7 +87,6 @@ const Flash = (() => {
           </div>
         </div>
 
-        <!-- ── First-time setup (rare — only for brand new/unflashed boards) ── -->
         <details class="flash-mode-card">
           <summary style="cursor:pointer; font-weight:600;">
             🔧 First-time device setup (advanced)
@@ -131,7 +117,6 @@ const Flash = (() => {
           </button>
         </details>
 
-        <!-- ── Export ── -->
         <div class="flash-mode-card">
           <div class="flash-mode-title">📄 Export Config</div>
           <div class="flash-mode-desc">
@@ -188,7 +173,7 @@ const Flash = (() => {
 
 
   // ════════════════════════════════════════
-  //  SEND TO DEVICE — the auto-deciding primary action
+  //  SEND TO DEVICE
   // ════════════════════════════════════════
 
   async function _onSendToDevice() {
@@ -201,21 +186,16 @@ const Flash = (() => {
     if (cancelBtn) cancelBtn.classList.remove('hidden');
 
     try {
-      // ── Step 1: connect — device must be in its NORMAL running state,
-      // NOT bootloader mode. The Studio RPC server runs permanently
-      // alongside regular keyboard function once built with
-      // CONFIG_ZMK_STUDIO=y, so no reset is required here. ──
-      if (!WebSerial.isConnected()) {
-        _setProgress(5, 'Connecting to device…');
-        await StudioRpc.connect();
-      }
+      _setProgress(5, 'Connecting to device…');
+      await StudioRpc.connect();
       _liveConnected = true;
 
       _setProgress(15, 'Loading device capabilities…');
-      await StudioRpc.loadAllBehaviors();
+      await StudioRpc.loadAllBehaviors((done, total) => {
+        _setProgress(15 + Math.floor((done / total) * 10), `Loading behaviors… ${done}/${total}`);
+      });
       const liveKeymap = await StudioRpc.getKeymap();
 
-      // ── Step 2: decide — live push vs full compile fallback ──
       _setProgress(25, 'Checking what changed…');
       const decision = _decideAction(State.get(), liveKeymap);
 
@@ -225,7 +205,6 @@ const Flash = (() => {
         return;
       }
 
-      // ── Step 3: live push every layer's keys ──
       await _pushAllLayersLive(liveKeymap);
 
       _setProgress(90, 'Saving to device flash…');
@@ -248,34 +227,43 @@ const Flash = (() => {
     }
   }
 
-  // Mirrors the decideAction logic from the original handoff doc:
-  // structural changes (more layers than firmware can hold, or a keycode
-  // that can't be represented live) require the full compile fallback.
+  // ★ FIX: now logs the exact layer/key/code that caused a fallback to
+  // console.table, so future translator gaps are instantly diagnosable
+  // instead of requiring manual screenshot-by-screenshot debugging.
   function _decideAction(state, liveKeymap) {
     if (state.layers.length > liveKeymap.available_layers) {
+      console.warn('[Flash] FLASH_REQUIRED: layer count', state.layers.length, '>', liveKeymap.available_layers);
       return { action: 'FLASH_REQUIRED', reason: 'more layers than firmware supports' };
     }
 
-    for (const layer of state.layers) {
+    const problems = [];
+
+    state.layers.forEach(layer => {
       const { unsupported } = ZmkStringTranslator.translateLayer(layer.keys, liveKeymap.layers);
-      if (unsupported.length > 0) {
-        return { action: 'FLASH_REQUIRED', reason: 'unsupported key binding — needs recompile' };
-      }
+      unsupported.forEach(u => {
+        problems.push({ layer: layer.name, position: `key ${u.index + 1}`, code: u.code });
+      });
+
       if (ZmkStringTranslator.translate(layer.fnAction, liveKeymap.layers) === null) {
-        return { action: 'FLASH_REQUIRED', reason: 'unsupported FN binding' };
+        problems.push({ layer: layer.name, position: 'FN key', code: layer.fnAction });
       }
       if (layer.encoderPush && ZmkStringTranslator.translate(layer.encoderPush, liveKeymap.layers) === null) {
-        return { action: 'FLASH_REQUIRED', reason: 'unsupported encoder-push binding' };
+        problems.push({ layer: layer.name, position: 'encoder push', code: layer.encoderPush });
       }
+    });
+
+    if (problems.length > 0) {
+      console.warn('[Flash] FLASH_REQUIRED — untranslatable codes found:');
+      console.table(problems);
+      return {
+        action: 'FLASH_REQUIRED',
+        reason: `unsupported code "${problems[0].code}" on ${problems[0].layer} (${problems[0].position})`,
+      };
     }
 
     return { action: 'SAVE_ONLY' };
   }
 
-  // Pushes every layer's keys + FN + encoder-push over RPC.
-  // Adds missing layers live first if State has more layers than the device
-  // currently has (but still within available_layers capacity — confirmed
-  // safe by _decideAction before this is ever called).
   async function _pushAllLayersLive(liveKeymap) {
     const stateLayers = State.get().layers;
 
@@ -296,17 +284,14 @@ const Flash = (() => {
         await StudioRpc.setLayerProps(liveLayer.id, stateLayer.name);
       }
 
-      // Matrix keys (positions 0-8)
       const { bindings } = ZmkStringTranslator.translateLayer(stateLayer.keys, liveKeymap.layers);
       for (let ki = 0; ki < bindings.length; ki++) {
         await StudioRpc.setKeyBinding(liveLayer.id, ki, bindings[ki]);
       }
 
-      // FN key (position 9)
       const fnBinding = ZmkStringTranslator.translate(stateLayer.fnAction, liveKeymap.layers);
       if (fnBinding) await StudioRpc.setKeyBinding(liveLayer.id, 9, fnBinding);
 
-      // Encoder push (position 10)
       if (stateLayer.encoderPush) {
         const encBinding = ZmkStringTranslator.translate(stateLayer.encoderPush, liveKeymap.layers);
         if (encBinding) await StudioRpc.setKeyBinding(liveLayer.id, 10, encBinding);
@@ -317,8 +302,6 @@ const Flash = (() => {
 
   // ════════════════════════════════════════
   //  FALLBACK — full GitHub Actions compile + WebUSB flash
-  //  (this IS where bootloader mode is genuinely required — the .uf2 file
-  //  can only be written while the device is in its bootloader drive mode)
   // ════════════════════════════════════════
 
   async function _runFullCompileFallback() {
@@ -347,9 +330,7 @@ const Flash = (() => {
 
 
   // ════════════════════════════════════════
-  //  FIRST-TIME SETUP — install base Studio-enabled firmware (advanced/rare)
-  //  Genuinely requires bootloader mode — writing a raw .uf2 file only works
-  //  while the device is in its bootloader drive, not while running normally.
+  //  FIRST-TIME SETUP
   // ════════════════════════════════════════
 
   async function _onInstantFlash() {
@@ -415,8 +396,6 @@ const Flash = (() => {
   function init() {
     console.log('[Flash] Ready —', SPAD_CONFIG.owner + '/' + SPAD_CONFIG.repo);
 
-    // Silent reconnect on page load, so returning users don't need to
-    // re-grant USB permission every time they open the Flash step.
     if (WebSerial.isSupported()) {
       WebSerial.reconnectSilently().then(ok => {
         if (ok) _liveConnected = true;
