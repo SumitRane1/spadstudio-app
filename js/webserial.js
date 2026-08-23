@@ -5,22 +5,28 @@
 // This module ONLY handles raw serial transport (connect/read/write/disconnect).
 // Protobuf RPC framing/parsing lives in studioRpc.js.
 //
-// IMPORTANT FOR FIRST TESTING:
-// requestPort() intentionally has NO vendor/product filter. ZMK Studio's
-// USB-CDC serial interface can use a VID/PID different from the board's
-// bootloader VID/PID. A filter caused Chrome to display "No compatible
-// devices found" even if the device was present. Once a real device is
-// confirmed in the chooser, add its exact VID/PID later if desired.
+// ═══ FIX (2026-08-24) — SERIALIZED WRITES ═══
+// StudioRpc.loadAllBehaviors() fires many getBehaviorDetails() calls in
+// parallel via Promise.all(). Each one called write(), and each write()
+// independently called _port.writable.getWriter(). When two writes
+// overlapped in time, the second getWriter() threw:
+//   "Cannot create writer when WritableStream is locked"
+// Fix: all writes now go through a single promise chain (_writeQueue) so
+// only one write is ever in flight on the stream at a time, regardless of
+// how many callers invoke write() concurrently.
 
 
 const WebSerial = (() => {
 
   let _port                 = null;
   let _reader               = null;
-  let _writer               = null;
   let _readLoopAbort        = false;
   let _onDataCallback       = null;
   let _onDisconnectCallback = null;
+
+  // Serializes all write() calls so only one is ever active on the
+  // WritableStream at a time — prevents concurrent getWriter() lock errors.
+  let _writeQueue = Promise.resolve();
 
   // ════════════════════════════════════════
   //  SUPPORT CHECK
@@ -44,17 +50,15 @@ const WebSerial = (() => {
     }
 
     try {
-      // Do NOT pass filters during initial testing.
-      // This displays every serial device that Windows/Chrome can see.
+      // No vendor/product filter — some Studio-enabled boards expose a
+      // USB-CDC VID/PID that differs from their bootloader VID/PID, and a
+      // filter here previously hid valid devices from the chooser.
       _port = await navigator.serial.requestPort();
     } catch (e) {
       if (e.name === 'NotFoundError') throw new Error('No device selected.');
       throw new Error('Could not open the serial device picker: ' + e.message);
     }
 
-    // The studio-rpc-usb-uart snippet uses USB CDC ACM. For CDC devices the
-    // baud rate is generally ignored by USB itself, but Web Serial still
-    // requires one when opening the port; 115200 is ZMK Studio's convention.
     const baudRate = options.baudRate || 115200;
 
     try {
@@ -63,6 +67,8 @@ const WebSerial = (() => {
       _port = null;
       throw new Error('Failed to open serial port: ' + e.message);
     }
+
+    _writeQueue = Promise.resolve(); // reset queue for the new connection
 
     navigator.serial.addEventListener('disconnect', _handleHardwareDisconnect);
 
@@ -98,7 +104,6 @@ const WebSerial = (() => {
         }
       }
     } catch (e) {
-      // cancel()/unplug commonly ends read() with an error; only log it.
       if (!_readLoopAbort) {
         console.warn('[WebSerial] Read loop ended:', e.message);
       }
@@ -110,18 +115,33 @@ const WebSerial = (() => {
 
   // ════════════════════════════════════════
   //  WRITE — send raw bytes (protobuf frames from studioRpc.js)
+  //  SERIALIZED: every call is chained onto _writeQueue so writes never
+  //  overlap, even if multiple callers invoke write() at the same time.
   // ════════════════════════════════════════
 
-  async function write(bytes) {
+  function write(bytes) {
+    const payload = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+
+    // Chain this write onto the queue. Whether the previous write succeeded
+    // or failed, we still attempt this one — but we propagate this write's
+    // own success/failure to its caller via the returned promise.
+    const result = _writeQueue.then(() => _doWrite(payload));
+
+    // Keep the queue alive for the next caller regardless of outcome,
+    // so one failed write doesn't permanently jam the queue.
+    _writeQueue = result.catch(() => {});
+
+    return result;
+  }
+
+  async function _doWrite(payload) {
     if (!_port || !_port.writable) {
       throw new Error('Port not open. Call connect() first.');
     }
 
-    // A writer lock is temporary for each write. This avoids holding it while
-    // the read loop is running on its separate readable stream.
     const writer = _port.writable.getWriter();
     try {
-      await writer.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+      await writer.write(payload);
     } finally {
       writer.releaseLock();
     }
@@ -138,9 +158,13 @@ const WebSerial = (() => {
     try { _reader?.releaseLock(); } catch (e) {}
     _reader = null;
 
+    // Let any in-flight writes settle before closing the port.
+    try { await _writeQueue; } catch (e) {}
+
     const portToClose = _port;
     _port = null;
     _onDataCallback = null;
+    _writeQueue = Promise.resolve();
 
     navigator.serial.removeEventListener('disconnect', _handleHardwareDisconnect);
 
@@ -161,8 +185,8 @@ const WebSerial = (() => {
       _readLoopAbort = true;
       _port = null;
       _reader = null;
-      _writer = null;
       _onDataCallback = null;
+      _writeQueue = Promise.resolve();
 
       navigator.serial.removeEventListener('disconnect', _handleHardwareDisconnect);
       if (_onDisconnectCallback) _onDisconnectCallback();
@@ -195,13 +219,12 @@ const WebSerial = (() => {
     const ports = await navigator.serial.getPorts();
     if (ports.length === 0) return false;
 
-    // Usually only one device was granted. If multiple exist, the next normal
-    // Send to Device click lets the user choose explicitly in the picker.
     const candidate = ports[0];
 
     try {
       await candidate.open({ baudRate });
       _port = candidate;
+      _writeQueue = Promise.resolve();
       navigator.serial.addEventListener('disconnect', _handleHardwareDisconnect);
       console.log('[WebSerial] Silently reconnected to previously granted port', getDeviceInfo());
       return true;
