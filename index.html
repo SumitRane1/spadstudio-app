@@ -46,10 +46,6 @@
       <button class="step-btn" data-step="flash">
         <span class="step-num">4</span> Flash
       </button>
-      <span class="step-divider" aria-hidden="true">›</span>
-      <button class="step-btn" data-step="live-edit">
-        <span class="step-num">5</span> Live Edit
-      </button>
     </nav>
 
     <div class="header-actions">
@@ -177,81 +173,25 @@
     <section class="app-section" id="section-review">
       <div class="section-header">
         <h1 class="section-title">Review Configuration</h1>
-        <p class="section-sub">Check everything before flashing</p>
+        <p class="section-sub">Check everything before sending</p>
       </div>
       <div id="review-content">
         <!-- Rendered by review.js -->
       </div>
     </section>
 
-    <!-- ── SECTION 4: FLASH ── -->
+    <!-- ── SECTION 4: FLASH ("Send to Device") ── -->
     <section class="app-section" id="section-flash">
       <div class="section-header">
-        <h1 class="section-title">Flash Firmware</h1>
-        <p class="section-sub">One-time setup — writes Studio-enabled firmware to your macropad</p>
+        <h1 class="section-title">Send to Device</h1>
+        <p class="section-sub">Push your configuration to the macropad — instantly, most of the time</p>
       </div>
       <div id="flash-content">
         <!-- Rendered by flash.js -->
       </div>
     </section>
 
-    <!-- ── SECTION 5: LIVE EDIT (ZMK Studio RPC — no reflash needed) ── -->
-    <section class="app-section" id="section-live-edit">
-      <div class="section-header">
-        <h1 class="section-title">Live Edit Macros</h1>
-        <p class="section-sub">Connect over USB and edit keys instantly — no compiling, no reflashing</p>
-      </div>
-
-      <div class="live-connect-bar" id="live-connect-bar">
-        <!-- Rendered by editMacros.js -->
-      </div>
-
-      <div class="editor-layout">
-
-        <!-- Left: Layer tabs -->
-        <aside class="editor-sidebar">
-          <div class="sidebar-block">
-            <div class="sidebar-label">LAYERS</div>
-            <div class="layer-tabs" id="live-layer-tabs">
-              <!-- Rendered by editMacros.js -->
-            </div>
-            <button class="btn btn-ghost btn-sm btn-full" id="live-btn-add-layer">
-              + Add Layer
-            </button>
-          </div>
-        </aside>
-
-        <!-- Center: Visual pad -->
-        <div class="editor-center">
-          <div class="pad-wrapper">
-            <div class="pad-label">NICENANO MACROPAD — LIVE</div>
-            <div class="pad-grid" id="live-pad-grid">
-              <!-- Rendered by editMacros.js -->
-            </div>
-          </div>
-        </div>
-
-        <!-- Right: Inspector -->
-        <aside class="editor-inspector" id="live-editor-inspector">
-          <div class="inspector-empty" id="live-inspector-empty">
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none"
-                 stroke="currentColor" stroke-width="1.5" opacity="0.3">
-              <rect x="3"  y="3"  width="7" height="7" rx="1"/>
-              <rect x="14" y="3"  width="7" height="7" rx="1"/>
-              <rect x="3"  y="14" width="7" height="7" rx="1"/>
-              <rect x="14" y="14" width="7" height="7" rx="1"/>
-            </svg>
-            <p>Click any key to edit its binding</p>
-          </div>
-          <div class="inspector-content hidden" id="live-inspector-content">
-            <!-- Rendered by editMacros.js when key is selected -->
-          </div>
-        </aside>
-
-      </div>
-    </section>
-
-    <!-- ── SECTION 6: DEVICE (standalone, not a step) ── -->
+    <!-- ── SECTION 5: DEVICE (standalone, not a step) ── -->
     <section class="app-section" id="section-device">
       <div id="device-content">
         <!-- Rendered by device.js -->
@@ -260,7 +200,7 @@
 
   </main>
 
-  <!-- ═══ KEY PICKER MODAL — shared by editor.js (compile flow) and editMacros.js (live flow) ═══ -->
+  <!-- ═══ KEY PICKER MODAL ═══ -->
   <div class="modal-overlay hidden" id="modal-overlay">
     <div class="modal" id="modal-keypicker" role="dialog" aria-modal="true"
          aria-labelledby="keypicker-title">
@@ -275,10 +215,10 @@
                aria-label="Search keycodes" />
       </div>
       <div class="modal-categories" id="modal-categories">
-        <!-- Category filter tabs rendered by keycodes.js / editMacros.js -->
+        <!-- Category filter tabs rendered by keycodes.js -->
       </div>
       <div class="modal-keylist" id="modal-keylist">
-        <!-- Key list rendered by keycodes.js / editMacros.js -->
+        <!-- Key list rendered by keycodes.js -->
       </div>
       <div class="modal-footer">
         <span class="selected-preview" id="selected-preview">No binding selected</span>
@@ -315,8 +255,8 @@
   <script src="js/webserial.js"></script>
   <script src="js/studioRpc.js"></script>
   <script src="js/keycodeTranslator.js"></script>
+  <script src="js/zmkStringTranslator.js"></script>
   <script src="js/flash.js"></script>
-  <script src="js/editMacros.js"></script>
   <script src="js/device.js"></script>
   <script src="js/app.js"></script>
 
