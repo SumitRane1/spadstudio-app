@@ -1,9 +1,20 @@
 // ═══ STUDIO RPC — ZMK Studio protobuf RPC message layer ═══
 // Sits on top of WebSerial (webserial.js). Handles:
-//   1. Message FRAMING (SoF/Esc/EoF byte escaping) — per official ZMK spec
+//   1. Message FRAMING (SoF/Esc/EoF byte escaping) — verified against the
+//      official spec: https://zmk.dev/docs/development/studio-rpc-protocol
 //   2. Protobuf ENCODE/DECODE of Request/Response messages
 //   3. A request/response promise-matching layer keyed by request_id
 //   4. Behavior discovery + caching (behaviors.proto)
+//
+// ═══ ROOT CAUSE FIX (2026-08-24) ═══
+// Root cause of the "RPC request timed out" bug: protobufjs converts .proto
+// field names to camelCase by default (request_id -> requestId,
+// list_all_behaviors -> listAllBehaviors). Our code builds request objects
+// using the ORIGINAL snake_case names from the .proto files, so
+// Message.create() was silently dropping every field it didn't recognize —
+// we were sending nearly-empty messages the firmware correctly ignored.
+// Fix: load the proto root with { keepCase: true } so field names stay
+// exactly as declared in the .proto files, matching this file's code.
 //
 // Corrected against the ACTUAL proto schema in this project:
 //   assets/proto/studio.proto     — Request/Response/Notification envelope
@@ -11,13 +22,11 @@
 //   assets/proto/core.proto
 //   assets/proto/behaviors.proto  — ListAllBehaviors, GetBehaviorDetails
 //   assets/proto/keymap.proto     — Keymap, Layer, BehaviorBinding, PhysicalLayout
-//
-// Reference: https://zmk.dev/docs/development/studio-rpc-protocol
 
 
 const StudioRpc = (() => {
 
-  // ── Framing bytes (per ZMK Studio RPC protocol spec) ──
+  // ── Framing bytes (verified against official ZMK Studio RPC protocol spec) ──
   const SOF = 0xAB; // Start of Frame
   const ESC = 0xAC; // Escape byte
   const EOF = 0xAD; // End of Frame
@@ -55,7 +64,11 @@ const StudioRpc = (() => {
     }
 
     try {
-      _protoRoot = await protobuf.load('./assets/proto/studio.proto');
+      // ★ THE FIX ★ — { keepCase: true } preserves snake_case field names
+      // (request_id, list_all_behaviors, etc.) instead of protobufjs
+      // silently camelCasing them and dropping our fields on .create().
+      const root = new protobuf.Root();
+      _protoRoot = await root.load('./assets/proto/studio.proto', { keepCase: true });
     } catch (e) {
       throw new Error(
         'Could not load ZMK Studio .proto schema from ./assets/proto/studio.proto. ' +
@@ -66,7 +79,7 @@ const StudioRpc = (() => {
     _RequestMsg  = _protoRoot.lookupType('zmk.studio.Request');
     _ResponseMsg = _protoRoot.lookupType('zmk.studio.Response');
 
-    console.log('[StudioRpc] Proto schema loaded ✓');
+    console.log('[StudioRpc] Proto schema loaded ✓ (keepCase: true)');
   }
 
 
@@ -111,7 +124,10 @@ const StudioRpc = (() => {
 
     const message = _RequestMsg.create(requestObj);
     const encoded = _RequestMsg.encode(message).finish(); // Uint8Array
-    const framed  = _frame(encoded);
+
+    console.log('[StudioRpc] Sending', subsystem, payload, '→', encoded.length, 'bytes encoded');
+
+    const framed = _frame(encoded);
 
     const promise = new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -188,9 +204,8 @@ const StudioRpc = (() => {
         continue;
       }
 
-      // A raw SoF appearing mid-frame (unescaped) means we lost sync —
-      // restart framing from here defensively.
       if (b === SOF) {
+        // Unescaped SoF mid-frame means we lost sync — restart defensively.
         _rxBuffer = [];
         continue;
       }
@@ -209,18 +224,19 @@ const StudioRpc = (() => {
     try {
       decoded = _ResponseMsg.decode(bytes);
     } catch (e) {
-      console.warn('[StudioRpc] Failed to decode frame:', e.message);
+      console.warn('[StudioRpc] Failed to decode frame:', e.message, bytes);
       return;
     }
 
-    // Response.type is `oneof { request_response, notification }`
+    console.log('[StudioRpc] Received frame:', decoded);
+
     if (decoded.request_response) {
       const rr = decoded.request_response;
       const pending = _pendingRequests.get(rr.request_id);
       if (pending) {
         clearTimeout(pending.timeout);
         _pendingRequests.delete(rr.request_id);
-        pending.resolve(rr); // rr.keymap / rr.core / rr.behaviors / rr.meta
+        pending.resolve(rr);
       } else {
         console.warn('[StudioRpc] Response for unknown request_id', rr.request_id);
       }
@@ -251,30 +267,22 @@ const StudioRpc = (() => {
   //  KEYMAP METHODS — matched against real keymap.proto
   // ════════════════════════════════════════
 
-  // zmk.keymap.Request.get_keymap is `bool` → send `true`
-  // Response: rr.keymap.get_keymap → Keymap { layers[], available_layers, max_layer_name_length }
   async function getKeymap() {
     const rr = await sendRequest('keymap', { get_keymap: true });
     return rr.keymap.get_keymap;
   }
 
-  // zmk.keymap.Request.get_physical_layouts is `bool` → send `true`
-  // Response: rr.keymap.get_physical_layouts → PhysicalLayouts { active_layout_index, layouts[] }
   async function getPhysicalLayouts() {
     const rr = await sendRequest('keymap', { get_physical_layouts: true });
     return rr.keymap.get_physical_layouts;
   }
 
-  // Write a single key binding.
-  // binding must match BehaviorBinding { behavior_id (sint32), param1, param2 }
-  // behavior_id is a NUMERIC id from getBehaviors() — not a string like "LCZ".
-  // Response: rr.keymap.set_layer_binding → SetLayerBindingResponse enum (0 = OK)
   async function setKeyBinding(layerId, keyPosition, behaviorBinding) {
     const rr = await sendRequest('keymap', {
       set_layer_binding: {
         layer_id: layerId,
         key_position: keyPosition,
-        binding: behaviorBinding, // { behavior_id, param1, param2 }
+        binding: behaviorBinding,
       },
     });
     return rr.keymap.set_layer_binding;
@@ -282,7 +290,7 @@ const StudioRpc = (() => {
 
   async function saveChanges() {
     const rr = await sendRequest('keymap', { save_changes: true });
-    return rr.keymap.save_changes; // { ok: true } or { err: SaveChangesErrorCode }
+    return rr.keymap.save_changes;
   }
 
   async function discardChanges() {
@@ -297,7 +305,7 @@ const StudioRpc = (() => {
 
   async function addLayer() {
     const rr = await sendRequest('keymap', { add_layer: {} });
-    return rr.keymap.add_layer; // { ok: { index, layer } } or { err }
+    return rr.keymap.add_layer;
   }
 
   async function removeLayer(layerIndex) {
@@ -326,7 +334,7 @@ const StudioRpc = (() => {
 
   async function setActivePhysicalLayout(layoutIndex) {
     const rr = await sendRequest('keymap', { set_active_physical_layout: layoutIndex });
-    return rr.keymap.set_active_physical_layout; // { ok: Keymap } or { err }
+    return rr.keymap.set_active_physical_layout;
   }
 
 
@@ -334,16 +342,11 @@ const StudioRpc = (() => {
   //  BEHAVIOR METHODS — matched against real behaviors.proto
   // ════════════════════════════════════════
 
-  // zmk.behaviors.Request.list_all_behaviors is `bool` → send `true`
-  // Response: rr.behaviors.list_all_behaviors → ListAllBehaviorsResponse { behaviors: [uint32] }
   async function listAllBehaviorIds() {
     const rr = await sendRequest('behaviors', { list_all_behaviors: true });
-    return rr.behaviors.list_all_behaviors.behaviors; // array of numeric IDs
+    return rr.behaviors.list_all_behaviors.behaviors;
   }
 
-  // GetBehaviorDetailsRequest { behavior_id }
-  // Response: rr.behaviors.get_behavior_details → GetBehaviorDetailsResponse
-  //   { id, display_name, metadata: [BehaviorBindingParametersSet] }
   async function getBehaviorDetails(behaviorId) {
     const rr = await sendRequest('behaviors', {
       get_behavior_details: { behavior_id: behaviorId },
@@ -351,14 +354,10 @@ const StudioRpc = (() => {
     return rr.behaviors.get_behavior_details;
   }
 
-  // Fetches ALL behaviors + their details in one call, builds a lookup cache.
-  // Call this once after connect(), before rendering the keycode picker UI.
-  // Returns Map<behavior_id, { id, display_name, metadata }>
   async function loadAllBehaviors() {
     const ids = await listAllBehaviorIds();
     _behaviorCache.clear();
 
-    // Fetch details for every behavior in parallel
     const detailsList = await Promise.all(
       ids.map(id => getBehaviorDetails(id))
     );
@@ -371,7 +370,6 @@ const StudioRpc = (() => {
     return _behaviorCache;
   }
 
-  // Synchronous lookup after loadAllBehaviors() has run once.
   function getBehaviorFromCache(behaviorId) {
     return _behaviorCache.get(behaviorId) || null;
   }
@@ -380,16 +378,10 @@ const StudioRpc = (() => {
     return Array.from(_behaviorCache.values());
   }
 
-  // Find a behavior by its display_name (e.g. "Key Press", "Momentary Layer").
-  // Useful for a friendly-name keycode picker in editMacros.js.
   function findBehaviorByName(displayName) {
     return getAllCachedBehaviors().find(b => b.display_name === displayName) || null;
   }
 
-  // Helper: inspect a behavior's metadata to know what kind of value param1/param2
-  // expects — 'nil' | 'constant' | 'range' | 'hid_usage' | 'layer_id'.
-  // metadata is BehaviorBindingParametersSet[] — usually 1 entry describing
-  // the accepted shapes for param1 and param2.
   function describeParamType(paramValueDescription) {
     if (!paramValueDescription) return null;
     if (paramValueDescription.nil !== undefined)       return { type: 'nil' };
@@ -408,7 +400,6 @@ const StudioRpc = (() => {
     sendRequest,
     onNotification,
 
-    // Keymap
     getKeymap,
     getPhysicalLayouts,
     setKeyBinding,
@@ -422,7 +413,6 @@ const StudioRpc = (() => {
     setLayerProps,
     setActivePhysicalLayout,
 
-    // Behaviors
     listAllBehaviorIds,
     getBehaviorDetails,
     loadAllBehaviors,
