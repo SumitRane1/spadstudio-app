@@ -2,14 +2,9 @@
 
 const Router = (() => {
 
-  const steps = ['profiles', 'editor', 'review', 'flash', 'live-edit'];
+  const steps = ['profiles', 'editor', 'review', 'flash'];
   let _current  = 'profiles';
   let _previous = 'profiles';  // for Device page back button
-
-  // Steps that don't require a profile to be selected first
-  // (Live Edit talks directly to the device over USB — independent of
-  // the offline profile/compile config).
-  const STEPS_WITHOUT_PROFILE_REQUIREMENT = ['profiles', 'live-edit'];
 
   function goTo(sectionId) {
     const isStep = steps.includes(sectionId);
@@ -36,10 +31,9 @@ const Router = (() => {
       document.getElementById('btn-device')?.classList.remove('active');
 
       // Trigger renders
-      if (sectionId === 'editor')    { Editor.render(); Encoder.render(); Layers.render(); }
-      if (sectionId === 'review')      Review.render();
-      if (sectionId === 'flash')       Flash.render();
-      if (sectionId === 'live-edit')   EditMacros.render();
+      if (sectionId === 'editor')  { Editor.render(); Encoder.render(); Layers.render(); }
+      if (sectionId === 'review')   Review.render();
+      if (sectionId === 'flash')    Flash.render();
 
       _previous = _current;
       _current  = sectionId;
@@ -87,7 +81,7 @@ const Router = (() => {
     document.querySelectorAll('.step-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         const step = btn.dataset.step;
-        if (!STEPS_WITHOUT_PROFILE_REQUIREMENT.includes(step) && !State.get().profileId) {
+        if (step !== 'profiles' && !State.get().profileId) {
           App.showToast('Please select a profile first', 'warning');
           return;
         }
