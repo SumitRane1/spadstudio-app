@@ -60,8 +60,7 @@ const App = (() => {
     _restoreConfig();
 
     // Init all modules
-    Flash.init();       // restore GitHub config before router
-    EditMacros.init();  // live ZMK Studio RPC editor — also attempts silent reconnect
+    Flash.init();      // restore GitHub config, attempt silent WebSerial reconnect
     Router.init();
     Layers.init();
     Editor.init();
