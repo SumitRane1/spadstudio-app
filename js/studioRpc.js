@@ -3,13 +3,14 @@
 //   1. Message FRAMING (SoF/Esc/EoF byte escaping) — per official ZMK spec
 //   2. Protobuf ENCODE/DECODE of Request/Response messages
 //   3. A request/response promise-matching layer keyed by request_id
+//   4. Behavior discovery + caching (behaviors.proto)
 //
 // Corrected against the ACTUAL proto schema in this project:
-//   assets/proto/studio.proto   — Request/Response/Notification envelope
+//   assets/proto/studio.proto     — Request/Response/Notification envelope
 //   assets/proto/meta.proto
 //   assets/proto/core.proto
-//   assets/proto/behaviors.proto
-//   assets/proto/keymap.proto   — Keymap, Layer, BehaviorBinding, PhysicalLayout
+//   assets/proto/behaviors.proto  — ListAllBehaviors, GetBehaviorDetails
+//   assets/proto/keymap.proto     — Keymap, Layer, BehaviorBinding, PhysicalLayout
 //
 // Reference: https://zmk.dev/docs/development/studio-rpc-protocol
 
@@ -32,6 +33,9 @@ const StudioRpc = (() => {
   let _nextRequestId    = 1;
   let _pendingRequests  = new Map(); // request_id -> { resolve, reject, timeout }
   let _notificationHandlers = [];    // callbacks for unsolicited device notifications
+
+  // behavior_id -> { id, display_name, metadata } — populated by getBehaviors()
+  let _behaviorCache = new Map();
 
   const REQUEST_TIMEOUT_MS = 8000;
 
@@ -74,12 +78,14 @@ const StudioRpc = (() => {
     await init();
     await WebSerial.connect();
     WebSerial.startReading(_onSerialBytes);
+    _behaviorCache.clear();
     console.log('[StudioRpc] Connected and listening for frames');
   }
 
   async function disconnect() {
     _rejectAllPending(new Error('Disconnected'));
     await WebSerial.disconnect();
+    _behaviorCache.clear();
   }
 
 
@@ -242,8 +248,7 @@ const StudioRpc = (() => {
 
 
   // ════════════════════════════════════════
-  //  HIGH-LEVEL CONVENIENCE METHODS
-  //  — corrected against the real keymap.proto Request/Response oneofs
+  //  KEYMAP METHODS — matched against real keymap.proto
   // ════════════════════════════════════════
 
   // zmk.keymap.Request.get_keymap is `bool` → send `true`
@@ -263,7 +268,7 @@ const StudioRpc = (() => {
   // Write a single key binding.
   // binding must match BehaviorBinding { behavior_id (sint32), param1, param2 }
   // behavior_id is a NUMERIC id from getBehaviors() — not a string like "LCZ".
-  // Response: rr.keymap.set_layer_binding → SetLayerBindingResponse enum
+  // Response: rr.keymap.set_layer_binding → SetLayerBindingResponse enum (0 = OK)
   async function setKeyBinding(layerId, keyPosition, behaviorBinding) {
     const rr = await sendRequest('keymap', {
       set_layer_binding: {
@@ -272,48 +277,39 @@ const StudioRpc = (() => {
         binding: behaviorBinding, // { behavior_id, param1, param2 }
       },
     });
-    return rr.keymap.set_layer_binding; // enum: 0 = OK
+    return rr.keymap.set_layer_binding;
   }
 
-  // zmk.keymap.Request.save_changes is `bool` → send `true`
-  // Response: rr.keymap.save_changes → SaveChangesResponse { ok } or { err: SaveChangesErrorCode }
   async function saveChanges() {
     const rr = await sendRequest('keymap', { save_changes: true });
-    return rr.keymap.save_changes;
+    return rr.keymap.save_changes; // { ok: true } or { err: SaveChangesErrorCode }
   }
 
-  // zmk.keymap.Request.discard_changes is `bool` → send `true`
   async function discardChanges() {
     const rr = await sendRequest('keymap', { discard_changes: true });
     return rr.keymap.discard_changes;
   }
 
-  // zmk.keymap.Request.check_unsaved_changes is `bool` → send `true`
   async function checkUnsavedChanges() {
     const rr = await sendRequest('keymap', { check_unsaved_changes: true });
     return rr.keymap.check_unsaved_changes;
   }
 
-  // AddLayerRequest is an empty message → send `{}`
-  // Response: rr.keymap.add_layer → AddLayerResponse { ok: { index, layer } } or { err }
   async function addLayer() {
     const rr = await sendRequest('keymap', { add_layer: {} });
-    return rr.keymap.add_layer;
+    return rr.keymap.add_layer; // { ok: { index, layer } } or { err }
   }
 
-  // RemoveLayerRequest { layer_index }
   async function removeLayer(layerIndex) {
     const rr = await sendRequest('keymap', { remove_layer: { layer_index: layerIndex } });
     return rr.keymap.remove_layer;
   }
 
-  // RestoreLayerRequest { layer_id, at_index }
   async function restoreLayer(layerId, atIndex) {
     const rr = await sendRequest('keymap', { restore_layer: { layer_id: layerId, at_index: atIndex } });
     return rr.keymap.restore_layer;
   }
 
-  // MoveLayerRequest { start_index, dest_index }
   async function moveLayer(startIndex, destIndex) {
     const rr = await sendRequest('keymap', {
       move_layer: { start_index: startIndex, dest_index: destIndex },
@@ -321,7 +317,6 @@ const StudioRpc = (() => {
     return rr.keymap.move_layer;
   }
 
-  // SetLayerPropsRequest { layer_id, name }
   async function setLayerProps(layerId, name) {
     const rr = await sendRequest('keymap', {
       set_layer_props: { layer_id: layerId, name },
@@ -329,16 +324,81 @@ const StudioRpc = (() => {
     return rr.keymap.set_layer_props;
   }
 
-  // zmk.keymap.Request.set_active_physical_layout is `uint32` (layout index)
   async function setActivePhysicalLayout(layoutIndex) {
     const rr = await sendRequest('keymap', { set_active_physical_layout: layoutIndex });
     return rr.keymap.set_active_physical_layout; // { ok: Keymap } or { err }
   }
 
-  // NOTE: behaviors.proto wasn't pasted yet — once you share it, I'll add
-  // getBehaviors() / getBehaviorDetails() here with the exact request/response
-  // field names (needed to build the friendly-name → behavior_id lookup table
-  // for the keycode picker UI in editMacros.js).
+
+  // ════════════════════════════════════════
+  //  BEHAVIOR METHODS — matched against real behaviors.proto
+  // ════════════════════════════════════════
+
+  // zmk.behaviors.Request.list_all_behaviors is `bool` → send `true`
+  // Response: rr.behaviors.list_all_behaviors → ListAllBehaviorsResponse { behaviors: [uint32] }
+  async function listAllBehaviorIds() {
+    const rr = await sendRequest('behaviors', { list_all_behaviors: true });
+    return rr.behaviors.list_all_behaviors.behaviors; // array of numeric IDs
+  }
+
+  // GetBehaviorDetailsRequest { behavior_id }
+  // Response: rr.behaviors.get_behavior_details → GetBehaviorDetailsResponse
+  //   { id, display_name, metadata: [BehaviorBindingParametersSet] }
+  async function getBehaviorDetails(behaviorId) {
+    const rr = await sendRequest('behaviors', {
+      get_behavior_details: { behavior_id: behaviorId },
+    });
+    return rr.behaviors.get_behavior_details;
+  }
+
+  // Fetches ALL behaviors + their details in one call, builds a lookup cache.
+  // Call this once after connect(), before rendering the keycode picker UI.
+  // Returns Map<behavior_id, { id, display_name, metadata }>
+  async function loadAllBehaviors() {
+    const ids = await listAllBehaviorIds();
+    _behaviorCache.clear();
+
+    // Fetch details for every behavior in parallel
+    const detailsList = await Promise.all(
+      ids.map(id => getBehaviorDetails(id))
+    );
+
+    detailsList.forEach(details => {
+      _behaviorCache.set(details.id, details);
+    });
+
+    console.log(`[StudioRpc] Loaded ${_behaviorCache.size} behaviors`);
+    return _behaviorCache;
+  }
+
+  // Synchronous lookup after loadAllBehaviors() has run once.
+  function getBehaviorFromCache(behaviorId) {
+    return _behaviorCache.get(behaviorId) || null;
+  }
+
+  function getAllCachedBehaviors() {
+    return Array.from(_behaviorCache.values());
+  }
+
+  // Find a behavior by its display_name (e.g. "Key Press", "Momentary Layer").
+  // Useful for a friendly-name keycode picker in editMacros.js.
+  function findBehaviorByName(displayName) {
+    return getAllCachedBehaviors().find(b => b.display_name === displayName) || null;
+  }
+
+  // Helper: inspect a behavior's metadata to know what kind of value param1/param2
+  // expects — 'nil' | 'constant' | 'range' | 'hid_usage' | 'layer_id'.
+  // metadata is BehaviorBindingParametersSet[] — usually 1 entry describing
+  // the accepted shapes for param1 and param2.
+  function describeParamType(paramValueDescription) {
+    if (!paramValueDescription) return null;
+    if (paramValueDescription.nil !== undefined)       return { type: 'nil' };
+    if (paramValueDescription.constant !== undefined)  return { type: 'constant', value: paramValueDescription.constant };
+    if (paramValueDescription.range !== undefined)     return { type: 'range', min: paramValueDescription.range.min, max: paramValueDescription.range.max };
+    if (paramValueDescription.hid_usage !== undefined) return { type: 'hid_usage', keyboardMax: paramValueDescription.hid_usage.keyboard_max, consumerMax: paramValueDescription.hid_usage.consumer_max };
+    if (paramValueDescription.layer_id !== undefined)  return { type: 'layer_id' };
+    return null;
+  }
 
 
   return {
@@ -347,6 +407,8 @@ const StudioRpc = (() => {
     disconnect,
     sendRequest,
     onNotification,
+
+    // Keymap
     getKeymap,
     getPhysicalLayouts,
     setKeyBinding,
@@ -359,6 +421,15 @@ const StudioRpc = (() => {
     moveLayer,
     setLayerProps,
     setActivePhysicalLayout,
+
+    // Behaviors
+    listAllBehaviorIds,
+    getBehaviorDetails,
+    loadAllBehaviors,
+    getBehaviorFromCache,
+    getAllCachedBehaviors,
+    findBehaviorByName,
+    describeParamType,
   };
 
 })();
