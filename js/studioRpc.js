@@ -6,14 +6,17 @@
 //   loading with { keepCase: true } preserves snake_case, matching this file.
 // Fix 2 (serialized writes): webserial.js now queues all write() calls so
 //   they never collide on the WritableStream lock.
-// Fix 3 (THIS FILE, sequential RPC pacing): loadAllBehaviors() previously
-//   fired all getBehaviorDetails() calls via Promise.all — sending requests
-//   as fast as JS could loop, with no regard for whether the firmware had
-//   replied yet. ZMK Studio's RPC buffers are tiny by default
-//   (CONFIG_ZMK_STUDIO_RPC_RX_BUF_SIZE / TX_BUF_SIZE, ~30-64 bytes), so the
-//   firmware can only track a few in-flight requests before dropping later
-//   ones — this is why request #5 (and beyond) timed out. Fix: await each
-//   request fully before sending the next one.
+// Fix 3 (sequential RPC pacing): loadAllBehaviors() sends requests one at a
+//   time instead of Promise.all(), respecting the firmware's small RPC buffers.
+// Fix 4 (THIS FILE — idempotent connect): Flash.init() silently reconnects
+//   WebSerial's raw port on page load via WebSerial.reconnectSilently(). That
+//   made WebSerial.isConnected() return true immediately, so flash.js's
+//   `if (!WebSerial.isConnected()) await StudioRpc.connect()` guard skipped
+//   calling StudioRpc.connect() entirely — meaning the .proto schema was
+//   NEVER loaded and the read loop was NEVER wired up, even though the UI
+//   showed "Device connected". connect() is now idempotent: it always
+//   ensures init() (proto load) has run and the read loop is listening,
+//   while only opening the WebSerial picker if a port isn't already open.
 
 
 const StudioRpc = (() => {
@@ -35,16 +38,17 @@ const StudioRpc = (() => {
   let _notificationHandlers = [];
 
   let _behaviorCache = new Map();
+  let _isListening   = false; // guards against double read-loop registration
 
   const REQUEST_TIMEOUT_MS = 8000;
 
 
   // ════════════════════════════════════════
-  //  INIT
+  //  INIT — loads the .proto schema. Safe to call multiple times.
   // ════════════════════════════════════════
 
   async function init() {
-    if (_protoRoot) return;
+    if (_protoRoot) return; // already loaded — no-op
 
     if (typeof protobuf === 'undefined') {
       throw new Error(
@@ -71,21 +75,38 @@ const StudioRpc = (() => {
 
 
   // ════════════════════════════════════════
-  //  CONNECT
+  //  CONNECT — IDEMPOTENT. Safe to call every time before an RPC operation,
+  //  whether or not WebSerial already has a port open from a silent
+  //  reconnect, a previous StudioRpc.connect() call, or a fresh session.
   // ════════════════════════════════════════
 
   async function connect() {
+    // 1. Always ensure the proto schema is loaded (no-ops if already done).
     await init();
-    await WebSerial.connect();
-    WebSerial.startReading(_onSerialBytes);
-    _behaviorCache.clear();
-    console.log('[StudioRpc] Connected and listening for frames');
+
+    // 2. Only open the device picker if no port is open yet. If
+    //    WebSerial.reconnectSilently() already opened one (e.g. on page
+    //    load), this is skipped — no redundant/duplicate picker popup.
+    if (!WebSerial.isConnected()) {
+      await WebSerial.connect();
+    }
+
+    // 3. Only start the read loop once per connection. Calling
+    //    startReading() twice would grab a second reader on an
+    //    already-locked ReadableStream and throw.
+    if (!_isListening) {
+      WebSerial.startReading(_onSerialBytes);
+      _isListening = true;
+    }
+
+    console.log('[StudioRpc] Ready — proto loaded, port open, listening for frames');
   }
 
   async function disconnect() {
     _rejectAllPending(new Error('Disconnected'));
     await WebSerial.disconnect();
     _behaviorCache.clear();
+    _isListening = false;
   }
 
 
@@ -94,7 +115,12 @@ const StudioRpc = (() => {
   // ════════════════════════════════════════
 
   function sendRequest(subsystem, payload) {
-    if (!_protoRoot) throw new Error('StudioRpc not initialized — call connect() first.');
+    if (!_protoRoot) {
+      throw new Error('StudioRpc not initialized — call StudioRpc.connect() first.');
+    }
+    if (!WebSerial.isConnected()) {
+      throw new Error('Device not connected — call StudioRpc.connect() first.');
+    }
 
     const requestId = _nextRequestId++;
 
@@ -132,13 +158,6 @@ const StudioRpc = (() => {
     });
 
     return promise;
-  }
-
-  // Sends a request and waits for its own response before returning —
-  // use this inside loops/batches instead of Promise.all(), so the
-  // firmware's small RPC buffers never get flooded with concurrent requests.
-  async function sendRequestSequential(subsystem, payload) {
-    return sendRequest(subsystem, payload);
   }
 
 
@@ -340,10 +359,6 @@ const StudioRpc = (() => {
     return rr.behaviors.get_behavior_details;
   }
 
-  // ★ FIX: sequential, not Promise.all(). Each getBehaviorDetails() call now
-  // fully completes (request sent, response received) before the next one
-  // is sent — this respects the firmware's small RPC buffer capacity and
-  // eliminates the request-N-times-out failures seen with parallel bursts.
   async function loadAllBehaviors(onProgress) {
     const ids = await listAllBehaviorIds();
     _behaviorCache.clear();
@@ -386,7 +401,6 @@ const StudioRpc = (() => {
     connect,
     disconnect,
     sendRequest,
-    sendRequestSequential,
     onNotification,
 
     getKeymap,
