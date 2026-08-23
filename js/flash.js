@@ -1,13 +1,20 @@
 // ═══ FLASH — Step 4: "Send to Device" (auto live-push or compile fallback) ═══
 //
 // Same 4-step flow as before (Profile → Editor → Review → Flash).
-// No separate "Live Edit" tab. This step now auto-decides per the original
-// decideAction logic:
+// Step 4 auto-decides per the original decideAction logic:
 //   - Small edits (keys within existing layer/key capacity)  -> instant
-//     live push over ZMK Studio RPC. No compile, no reflash.
+//     live push over ZMK Studio RPC. No compile, no reflash, NO bootloader
+//     mode — the device stays in its normal running state the whole time.
 //   - Structural changes (more layers than firmware pre-allocated, or a
 //     code that can't be represented live) -> falls back to the full
-//     GitHub Actions compile + WebUSB flash path (unchanged, kept intact).
+//     GitHub Actions compile + WebUSB flash path (which DOES require
+//     double-tap reset into bootloader mode — that instruction lives only
+//     in the "First-time setup" section below, where it belongs).
+//
+// IMPORTANT DISTINCTION:
+//   Bootloader mode (double-tap reset) = for writing raw .uf2 firmware files.
+//   Studio RPC connection             = talks to firmware that's ALREADY
+//                                        running normally. No reset needed.
 //
 // Depends on (load order): githubFlash.js, webusb.js, webserial.js,
 // studioRpc.js, keycodeTranslator.js, zmkStringTranslator.js, then flash.js.
@@ -71,7 +78,7 @@ const Flash = (() => {
           </div>
 
           <div class="flash-instructions">
-            <span>1.</span> Double-tap reset on your macropad (if not already connected)<br>
+            <span>1.</span> Plug in your macropad normally — no reset needed<br>
             <span>2.</span> Click Send to Device<br>
             <span>3.</span> Select your macropad from the browser popup (first time only)
           </div>
@@ -100,12 +107,14 @@ const Flash = (() => {
           </summary>
           <div class="flash-mode-desc" style="margin-top:var(--space-3);">
             Only needed once, when setting up a brand-new macropad that doesn't
-            yet have Studio-enabled firmware installed. After this, always use
-            <strong>Send to Device</strong> above — you'll never need this again.
+            yet have Studio-enabled firmware installed. This is the ONLY step
+            that requires bootloader mode. After this, always use
+            <strong>Send to Device</strong> above — you'll never need to
+            double-tap reset again.
           </div>
 
           <div class="flash-instructions">
-            <span>1.</span> Double-tap reset on your macropad<br>
+            <span>1.</span> Double-tap reset on your macropad (enters bootloader mode)<br>
             <span>2.</span> NICENANO drive appears on your PC<br>
             <span>3.</span> Click Install Base Firmware — Chrome / Edge only
           </div>
@@ -192,8 +201,10 @@ const Flash = (() => {
     if (cancelBtn) cancelBtn.classList.remove('hidden');
 
     try {
-      // ── Step 1: connect (device picker only shown once per session — this
-      // click IS the user gesture, so it's safe to call connect() directly) ──
+      // ── Step 1: connect — device must be in its NORMAL running state,
+      // NOT bootloader mode. The Studio RPC server runs permanently
+      // alongside regular keyboard function once built with
+      // CONFIG_ZMK_STUDIO=y, so no reset is required here. ──
       if (!WebSerial.isConnected()) {
         _setProgress(5, 'Connecting to device…');
         await StudioRpc.connect();
@@ -305,7 +316,9 @@ const Flash = (() => {
 
 
   // ════════════════════════════════════════
-  //  FALLBACK — full GitHub Actions compile + WebUSB flash (unchanged path)
+  //  FALLBACK — full GitHub Actions compile + WebUSB flash
+  //  (this IS where bootloader mode is genuinely required — the .uf2 file
+  //  can only be written while the device is in its bootloader drive mode)
   // ════════════════════════════════════════
 
   async function _runFullCompileFallback() {
@@ -319,7 +332,9 @@ const Flash = (() => {
       _setProgress(30 + Math.floor(pct * 0.5), msg);
     });
 
-    _setProgress(85, 'Flashing new firmware…');
+    _setProgress(85, 'Double-tap reset on your macropad now, then flashing…');
+    App.showToast('Structural change — double-tap reset on your macropad now', 'warning');
+
     await WebUSBFlash.flash(_uf2Buffer, (pct, msg) => {
       _setProgress(85 + Math.floor(pct * 0.15), msg);
     });
@@ -333,6 +348,8 @@ const Flash = (() => {
 
   // ════════════════════════════════════════
   //  FIRST-TIME SETUP — install base Studio-enabled firmware (advanced/rare)
+  //  Genuinely requires bootloader mode — writing a raw .uf2 file only works
+  //  while the device is in its bootloader drive, not while running normally.
   // ════════════════════════════════════════
 
   async function _onInstantFlash() {
