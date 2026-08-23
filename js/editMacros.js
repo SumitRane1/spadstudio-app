@@ -2,56 +2,35 @@
 // Mirrors editor.js / layers.js UI patterns exactly, but data comes from
 // StudioRpc (live device) instead of State.js (offline compile config).
 //
-// Requires in index.html (new section, namespaced IDs so old Editor.js
-// and this module never collide):
+// IMPORTANT CAVEATS (confirmed against a real .keymap + physical layout):
+//  1. Custom zero-param macros (e.g. FN round-robin behaviors like
+//     `media_to_system`) show up as their own behavior_id — NOT as
+//     Key Press/Layer/Transparent. The picker's "Macros" tab surfaces
+//     these so users never accidentally overwrite FN-cycle logic.
+//  2. Encoder ROTATION (sensor-bindings in the .keymap) is NOT exposed by
+//     zmk.keymap.Layer (only `bindings` for matrix+FN+encoder-PUSH exist).
+//     This is communicated via a banner — encoder CW/CCW still requires
+//     the old GitHub Actions recompile + reflash path.
 //
-//   <section class="app-section" id="section-live-edit">
-//     <div class="live-connect-bar" id="live-connect-bar"></div>
-//     <div class="editor-layout">
-//       <aside class="editor-sidebar">
-//         <div class="sidebar-block">
-//           <div class="sidebar-label">LAYERS</div>
-//           <div class="layer-tabs" id="live-layer-tabs"></div>
-//           <button class="btn btn-ghost btn-sm btn-full" id="live-btn-add-layer">+ Add Layer</button>
-//         </div>
-//       </aside>
-//       <div class="editor-center">
-//         <div class="pad-wrapper">
-//           <div class="pad-label">NICENANO MACROPAD — LIVE</div>
-//           <div class="pad-grid" id="live-pad-grid"></div>
-//         </div>
-//       </div>
-//       <aside class="editor-inspector">
-//         <div class="inspector-empty" id="live-inspector-empty">
-//           <p>Click any key to edit its binding</p>
-//         </div>
-//         <div class="inspector-content hidden" id="live-inspector-content"></div>
-//       </aside>
-//     </div>
-//   </section>
-//
-//   <!-- Reuses the SAME #modal-overlay/#modal-keylist/#modal-categories
-//        markup as the old key picker — just repopulated with live data
-//        when this module opens it (see _openModal below). -->
-//
+// Requires in index.html: see markup comment block (unchanged from before).
 // Script load order: webserial.js -> studioRpc.js -> keycodeTranslator.js
 // -> editMacros.js (after editor.js, since it borrows the modal DOM).
 
 
 const EditMacros = (() => {
 
-  let _liveKeymap        = null;  // { layers: [{id, name, bindings[]}], available_layers, max_layer_name_length }
-  let _physicalLayout    = null;  // { active_layout_index, layouts: [{ name, keys: [...] }] }
+  let _liveKeymap        = null;
+  let _physicalLayout    = null;
   let _activeLayerIndex  = 0;
-  let _selectedKeyPos    = null;  // index into bindings[] for the currently selected key
-  let _pendingBinding    = null;  // binding object staged in the modal before confirm
+  let _selectedKeyPos    = null;
+  let _pendingBinding    = null;
   let _pickerCategory    = 'Keyboard';
   let _isConnected       = false;
   let _isBusy            = false;
 
 
   // ════════════════════════════════════════
-  //  CONNECT — user gesture entry point
+  //  CONNECT
   // ════════════════════════════════════════
 
   async function connect() {
@@ -77,6 +56,7 @@ const EditMacros = (() => {
 
       _renderConnectBar('connected', `Connected · ${_liveKeymap.layers.length} layers`);
       render();
+      _renderEncoderCaveatBanner();
       App.showToast('Connected! Live editing enabled.', 'success');
 
     } catch (err) {
@@ -98,7 +78,6 @@ const EditMacros = (() => {
   }
 
   function _onDeviceNotification(notification) {
-    // zmk.keymap.Notification { unsaved_changes_status_changed }
     if (notification.keymap?.unsaved_changes_status_changed !== undefined) {
       const badge = document.getElementById('live-unsaved-badge');
       if (badge) badge.classList.toggle('hidden', false);
@@ -107,7 +86,7 @@ const EditMacros = (() => {
 
 
   // ════════════════════════════════════════
-  //  CONNECT BAR (mirrors flash.js banner style)
+  //  CONNECT BAR
   // ════════════════════════════════════════
 
   function _renderConnectBar(status, message) {
@@ -115,10 +94,7 @@ const EditMacros = (() => {
     if (!bar) return;
 
     const statusColors = {
-      idle:        'muted',
-      connecting:  'warning',
-      connected:   'success',
-      error:       'error',
+      idle: 'muted', connecting: 'warning', connected: 'success', error: 'error',
     };
 
     bar.innerHTML = `
@@ -137,11 +113,28 @@ const EditMacros = (() => {
           `}
         </div>
       </div>
+      <div id="live-encoder-caveat"></div>
     `;
 
     bar.querySelector('#live-btn-connect')?.addEventListener('click', connect);
     bar.querySelector('#live-btn-disconnect')?.addEventListener('click', disconnect);
     bar.querySelector('#live-btn-save')?.addEventListener('click', _onSaveChanges);
+  }
+
+  // Communicates the encoder-rotation limitation clearly, once connected.
+  function _renderEncoderCaveatBanner() {
+    const el = document.getElementById('live-encoder-caveat');
+    if (!el) return;
+    el.innerHTML = `
+      <div class="flash-mode-card" style="margin-top:var(--space-3); border-color: var(--color-warning);">
+        <div class="flash-mode-title" style="font-size:var(--text-sm);">ℹ️ Encoder rotation isn't live-editable</div>
+        <div class="flash-mode-desc" style="font-size:var(--text-xs);">
+          You can edit the 9 matrix keys, the FN key, and the encoder push button here.
+          Changing what the encoder does when you <strong>rotate</strong> it still requires
+          a full compile via the Flash tab — ZMK Studio doesn't expose sensor bindings yet.
+        </div>
+      </div>
+    `;
   }
 
   async function _onSaveChanges() {
@@ -166,7 +159,7 @@ const EditMacros = (() => {
 
 
   // ════════════════════════════════════════
-  //  RENDER — grid + layer tabs (mirrors editor.js/layers.js structure)
+  //  RENDER — grid + layer tabs
   // ════════════════════════════════════════
 
   function render() {
@@ -210,7 +203,7 @@ const EditMacros = (() => {
         try {
           const result = await StudioRpc.removeLayer(idx);
           if (result.ok) {
-            _liveKeymap = await StudioRpc.getKeymap(); // refresh from device
+            _liveKeymap = await StudioRpc.getKeymap();
             _activeLayerIndex = Math.min(_activeLayerIndex, _liveKeymap.layers.length - 1);
             render();
             App.showToast('Layer removed', 'success');
@@ -239,9 +232,11 @@ const EditMacros = (() => {
 
     container.innerHTML = layer.bindings.map((binding, i) => {
       const label = KeycodeTranslator.describeBinding(binding);
+      const isFnOrEncoder = i === 9 || i === 10; // per confirmed 11-position physical layout
       return `
-        <button class="key-btn" data-key-index="${i}" aria-label="Key ${i + 1}: ${label}">
-          <span class="key-index">${i + 1}</span>
+        <button class="key-btn ${isFnOrEncoder ? 'key-btn-special' : ''}" data-key-index="${i}"
+                aria-label="Key ${i + 1}: ${label}">
+          <span class="key-index">${i === 9 ? 'FN' : i === 10 ? 'ENC' : i + 1}</span>
           <span class="key-label">${label}</span>
         </button>
       `;
@@ -261,7 +256,7 @@ const EditMacros = (() => {
 
 
   // ════════════════════════════════════════
-  //  KEY SELECTION + INSPECTOR (mirrors editor.js)
+  //  KEY SELECTION + INSPECTOR
   // ════════════════════════════════════════
 
   function _selectKey(keyIndex) {
@@ -280,13 +275,14 @@ const EditMacros = (() => {
     const layer   = _liveKeymap.layers[_activeLayerIndex];
     const binding = layer.bindings[keyIndex];
     const label   = KeycodeTranslator.describeBinding(binding);
+    const isCustom = label.startsWith('⚙');
 
     empty.classList.add('hidden');
     content.classList.remove('hidden');
 
     content.innerHTML = `
       <div class="inspector-title">
-        Key ${keyIndex + 1}
+        ${keyIndex === 9 ? 'FN Key' : keyIndex === 10 ? 'Encoder Push' : `Key ${keyIndex + 1}`}
         <span style="font-size:var(--text-xs);color:var(--color-text-faint);font-weight:400;">
           (Layer: ${layer.name})
         </span>
@@ -294,6 +290,12 @@ const EditMacros = (() => {
       <div class="inspector-current">
         <div class="inspector-key-preview">${label}</div>
       </div>
+      ${isCustom ? `
+        <div style="font-size:var(--text-xs); color: var(--color-warning); margin-bottom: var(--space-3);">
+          ⚠️ This is a custom macro (likely FN-cycle logic). Changing it may
+          break layer switching — proceed only if you know what it does.
+        </div>
+      ` : ''}
       <button class="btn btn-primary btn-full" id="live-btn-change-key">Change Binding</button>
       <button class="btn btn-ghost btn-full btn-sm" id="live-btn-clear-key">Set Transparent</button>
     `;
@@ -315,7 +317,7 @@ const EditMacros = (() => {
 
 
   // ════════════════════════════════════════
-  //  APPLY A BINDING — send to device via RPC, refresh grid
+  //  APPLY A BINDING
   // ════════════════════════════════════════
 
   async function _applyBinding(keyIndex, binding) {
@@ -323,11 +325,10 @@ const EditMacros = (() => {
 
     try {
       const result = await StudioRpc.setKeyBinding(layer.id, keyIndex, binding);
-      if (result !== 0) { // 0 = SET_LAYER_BINDING_RESP_OK
+      if (result !== 0) {
         throw new Error('Device rejected binding (code ' + result + ')');
       }
 
-      // Optimistically update local cache, avoid a full re-fetch round trip
       layer.bindings[keyIndex] = binding;
       _renderGrid();
       _showInspector(keyIndex);
@@ -343,7 +344,7 @@ const EditMacros = (() => {
 
 
   // ════════════════════════════════════════
-  //  MODAL — reuses #modal-overlay from editor.js, repopulated with live data
+  //  MODAL — now with a "Macros" category for custom FN-cycle behaviors
   // ════════════════════════════════════════
 
   function _openModal(keyIndex) {
@@ -381,7 +382,9 @@ const EditMacros = (() => {
     document.getElementById('modal-overlay')?.classList.add('hidden');
   }
 
-  const PICKER_CATEGORIES = ['Keyboard', 'Media', 'Layers', 'Special'];
+  // Added 'Macros' — surfaces custom FN-cycle / mode-cycle behaviors so
+  // users can restore them if needed, instead of only generic key/layer options.
+  const PICKER_CATEGORIES = ['Keyboard', 'Media', 'Layers', 'Macros', 'Special'];
 
   function _renderModalCategories() {
     const container = document.getElementById('modal-categories');
@@ -416,13 +419,22 @@ const EditMacros = (() => {
         onSelect: () => KeycodeTranslator.buildKeyPressBinding(opt.value, [], true),
       }));
     } else if (_pickerCategory === 'Layers') {
-      options = _liveKeymap.layers.map((layer, idx) => ({
+      options = _liveKeymap.layers.map(layer => ({
         display: `Momentary: ${layer.name}`,
         onSelect: () => KeycodeTranslator.buildMomentaryLayerBinding(layer.id),
       })).concat(_liveKeymap.layers.map(layer => ({
         display: `Toggle: ${layer.name}`,
         onSelect: () => KeycodeTranslator.buildToggleLayerBinding(layer.id),
       })));
+    } else if (_pickerCategory === 'Macros') {
+      options = KeycodeTranslator.listMacroOptions().map(opt => ({
+        display: `⚙ ${opt.label}`,
+        onSelect: () => KeycodeTranslator.buildCustomBehaviorBinding(opt.value),
+      }));
+      if (options.length === 0) {
+        container.innerHTML = `<div style="padding:var(--space-6);text-align:center;color:var(--color-text-faint);grid-column:1/-1;">No custom macros found on this firmware</div>`;
+        return;
+      }
     } else if (_pickerCategory === 'Special') {
       options = [
         { display: '▽ Transparent', onSelect: () => KeycodeTranslator.buildTransparentBinding() },
@@ -469,7 +481,7 @@ const EditMacros = (() => {
 
 
   // ════════════════════════════════════════
-  //  ADD LAYER (simple — full preset picker can be layered on later)
+  //  ADD LAYER
   // ════════════════════════════════════════
 
   async function _onAddLayer() {
